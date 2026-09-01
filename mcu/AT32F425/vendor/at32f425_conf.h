@@ -46,12 +46,14 @@ extern "C" {
 #define HICK_VALUE                       ((uint32_t)8000000)
 #define LEXT_VALUE                       ((uint32_t)32768)
 
-/* module define: Stage A/B need CRM (clock) + GPIO + FLASH + TMR (PWM) ----- */
+/* module define: Stage A/B/C need CRM + GPIO + FLASH + TMR + ADC + DMA ----- */
 #define CRM_MODULE_ENABLED
 #define GPIO_MODULE_ENABLED
 #define FLASH_MODULE_ENABLED
 #define TMR_MODULE_ENABLED
 #define MISC_MODULE_ENABLED
+#define ADC_MODULE_ENABLED
+#define DMA_MODULE_ENABLED
 
 #ifdef CRM_MODULE_ENABLED
 #include "at32f425_crm.h"
@@ -67,6 +69,12 @@ extern "C" {
 #endif
 #ifdef MISC_MODULE_ENABLED
 #include "at32f425_misc.h"
+#endif
+#ifdef ADC_MODULE_ENABLED
+#include "at32f425_adc.h"
+#endif
+#ifdef DMA_MODULE_ENABLED
+#include "at32f425_dma.h"
 #endif
 
 #ifdef __cplusplus

@@ -127,6 +127,8 @@ function(add_at32f425_bringup name mainfile)
 		mcu/AT32F425/vendor/at32f425_flash.c
 		mcu/AT32F425/vendor/at32f425_tmr.c
 		mcu/AT32F425/vendor/at32f425_misc.c
+		mcu/AT32F425/vendor/at32f425_adc.c
+		mcu/AT32F425/vendor/at32f425_dma.c
 		mcu/AT32F425/vendor/startup_at32f425.s
 	)
 	target_include_directories(${elf} PRIVATE
@@ -154,3 +156,6 @@ endfunction()
 
 add_at32f425_bringup(MOUSEF425_STAGE_A mcu/AT32F425/stage_a_main.c)
 add_at32f425_bringup(MOUSEF425_STAGE_B mcu/AT32F425/stage_b_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_C mcu/AT32F425/stage_c_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_D mcu/AT32F425/stage_d_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_D_ACTIVE mcu/AT32F425/stage_d_active_main.c)
