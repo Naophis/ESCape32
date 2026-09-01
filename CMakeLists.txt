@@ -101,44 +101,56 @@ add_target(TMOTOR2 STM32F051 DEAD_TIME=26 COMP_MAP=321 SMALL_DEVICE)
 add_target(TMOTOR3 STM32G071 DEAD_TIME=35 COMP_MAP=231 IO_PA6)
 add_target(TMOTOR4 STM32G071 DEAD_TIME=35 COMP_MAP=123)
 
-# --- AT32F425 (MOUSEF425) Stage A bring-up ---------------------------------
-# Temporary, standalone target: does NOT use add_target() / mcu/common.ld,
-# and does NOT compile src/*.c (the shared ESCape32 control loop touches
-# TIM1/MP6540HA and calls compctl(), which are out of scope until the
-# Stage B/D work lands -- see mcu/AT32F425/stage_a_main.c and the porting
-# plan). This block will be replaced by a normal add_target(MOUSEF425
-# AT32F425 ...) call once the AT32F425 backend (config.c) exists.
+# --- AT32F425 (MOUSEF425) staged bring-up harnesses ------------------------
+# Temporary, standalone targets: do NOT use add_target() / mcu/common.ld,
+# and do NOT compile src/*.c (the shared ESCape32 control loop touches
+# TIM1/MP6540HA and calls compctl(), which has no real implementation
+# until the Stage D BEMF design lands -- see the porting-plan Section 18
+# report and mcu/AT32F425/stage_*_main.c). Each stage_*_main.c is its own
+# standalone main(); this function wires one up as its own firmware image.
 # No other target above this line is affected by this addition.
 include(mcu/AT32F425/config.cmake)
 enable_language(ASM)
 set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -x assembler-with-cpp")
-set(mousef425_stage_a_elf MOUSEF425_STAGE_A-rev17.1.elf)
-add_executable(${mousef425_stage_a_elf}
-	mcu/AT32F425/stage_a_main.c
-	mcu/AT32F425/vendor/system_at32f425.c
-	mcu/AT32F425/vendor/at32f425_crm.c
-	mcu/AT32F425/vendor/at32f425_gpio.c
-	mcu/AT32F425/vendor/at32f425_flash.c
-	mcu/AT32F425/vendor/startup_at32f425.s
-)
-target_include_directories(${mousef425_stage_a_elf} PRIVATE
-	mcu/AT32F425
-	mcu/AT32F425/vendor
-	mcu/AT32F425/cmsis_core
-)
-target_compile_options(${mousef425_stage_a_elf} PRIVATE ${at32f425_opts})
-target_compile_definitions(${mousef425_stage_a_elf} PRIVATE ${at32f425_defs})
-target_link_options(${mousef425_stage_a_elf} PRIVATE
-	-T${CMAKE_CURRENT_SOURCE_DIR}/mcu/AT32F425/config.ld
-	-nostartfiles -Wl,--gc-sections
-	${at32f425_opts}
-)
-target_link_libraries(${mousef425_stage_a_elf} c_nano gcc nosys)
-add_custom_command(
-	OUTPUT MOUSEF425_STAGE_A-rev17.1.bin MOUSEF425_STAGE_A-rev17.1.hex
-	COMMAND arm-none-eabi-objcopy -O binary ${mousef425_stage_a_elf} MOUSEF425_STAGE_A-rev17.1.bin
-	COMMAND arm-none-eabi-objcopy -O ihex ${mousef425_stage_a_elf} MOUSEF425_STAGE_A-rev17.1.hex
-	DEPENDS ${mousef425_stage_a_elf}
-)
-add_custom_target(MOUSEF425_STAGE_A ALL DEPENDS MOUSEF425_STAGE_A-rev17.1.hex)
-add_custom_target(flash-MOUSEF425_STAGE_A COMMAND st-flash --reset --connect-under-reset --format ihex write MOUSEF425_STAGE_A-rev17.1.hex DEPENDS MOUSEF425_STAGE_A-rev17.1.hex)
+
+function(add_at32f425_bringup name mainfile)
+	set(elf ${name}-rev17.1.elf)
+	set(bin ${name}-rev17.1.bin)
+	set(hex ${name}-rev17.1.hex)
+	add_executable(${elf}
+		${mainfile}
+		${ARGN}
+		mcu/AT32F425/clock_config.c
+		mcu/AT32F425/vendor/system_at32f425.c
+		mcu/AT32F425/vendor/at32f425_crm.c
+		mcu/AT32F425/vendor/at32f425_gpio.c
+		mcu/AT32F425/vendor/at32f425_flash.c
+		mcu/AT32F425/vendor/at32f425_tmr.c
+		mcu/AT32F425/vendor/at32f425_misc.c
+		mcu/AT32F425/vendor/startup_at32f425.s
+	)
+	target_include_directories(${elf} PRIVATE
+		mcu/AT32F425
+		mcu/AT32F425/vendor
+		mcu/AT32F425/cmsis_core
+	)
+	target_compile_options(${elf} PRIVATE ${at32f425_opts})
+	target_compile_definitions(${elf} PRIVATE ${at32f425_defs})
+	target_link_options(${elf} PRIVATE
+		-T${CMAKE_CURRENT_SOURCE_DIR}/mcu/AT32F425/config.ld
+		-nostartfiles -Wl,--gc-sections
+		${at32f425_opts}
+	)
+	target_link_libraries(${elf} c_nano gcc nosys)
+	add_custom_command(
+		OUTPUT ${bin} ${hex}
+		COMMAND arm-none-eabi-objcopy -O binary ${elf} ${bin}
+		COMMAND arm-none-eabi-objcopy -O ihex ${elf} ${hex}
+		DEPENDS ${elf}
+	)
+	add_custom_target(${name} ALL DEPENDS ${hex})
+	add_custom_target(flash-${name} COMMAND st-flash --reset --connect-under-reset --format ihex write ${hex} DEPENDS ${hex})
+endfunction()
+
+add_at32f425_bringup(MOUSEF425_STAGE_A mcu/AT32F425/stage_a_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_B mcu/AT32F425/stage_b_main.c)

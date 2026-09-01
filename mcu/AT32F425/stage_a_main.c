@@ -8,13 +8,18 @@
  *   - main() is reached with no HardFault,
  * WITHOUT touching TIM1 / MP6540HA / BEMF control (Stage B+).
  *
+ * The 96MHz clock sequence itself now lives in clock_config.c, shared
+ * with stage_b_main.c (extracted verbatim -- no logic change from what
+ * was hardware-verified here; see clock_config.c and the BUG FIX LOG
+ * below for the CRM_PLL_MULT_24 fix history). This file just calls it
+ * and re-exposes the same symbol names used during the first bring-up
+ * pass so existing OpenOCD scripts/watch expressions keep working.
+ *
  * This file deliberately does NOT go through the shared ESCape32
  * src/main.c control loop: that loop configures TIM1 (the MP6540HA
  * gate driver timer) and calls compctl(), which has no meaning on
  * AT32F425 (no analog comparator -- see porting-plan Section 18-G/H).
- * Wiring Stage A into that shared loop would require a compctl()
- * stub, which was intentionally deferred until the Stage D BEMF
- * design is in place. Stage A is therefore a standalone program.
+ * Stage A is therefore a standalone program.
  *
  * GPIO policy for this stage: no pin is driven by default. Per the
  * AT32F425 datasheet (Table 5 note), all GPIOs default to floating
@@ -69,20 +74,7 @@
  * ---------------------------------------------------------------------
  */
 
-#include "vendor/at32f425.h"
-
-/*
- * Clock plan (see porting-plan Section 18-B):
- *   HICK_VALUE/2 = 4 MHz PLL entry --x24 PLL--> 96 MHz
- * This path does NOT require an HEXT crystal. Official Artery BSP
- * examples default to HEXT x12 instead; we default to HICK here
- * because the presence of an HEXT crystal on this board has not
- * been confirmed (existing AT32F421 ESCape32 targets are crystal-less).
- * If HEXT is confirmed present, switch AT32F425_CLOCK_SOURCE_HEXT to 1
- * below and set HEXT_VALUE in vendor/at32f425_conf.h to the real
- * crystal frequency.
- */
-#define AT32F425_CLOCK_SOURCE_HEXT 0
+#include "clock_config.h"
 
 /*
  * Optional real-clock probe: CRM_CLKOUT_SCLK / DIV_16 on PA8, GPIO_MUX_0.
@@ -91,25 +83,20 @@
  * .../crm/clock_failure_detection/src/main.c: gpio_pin_mux_config(GPIOA,
  * GPIO_PINS_SOURCE8, GPIO_MUX_0) + crm_clock_out_set(...)) -- not guessed.
  *
- * DISABLED BY DEFAULT: PA8 is the pin this port plans to use for
- * TMR1_CH1 (MP6540HA HSA) from Stage B onward. Only enable this with
- * MP6540HA definitely unpowered / nSLEEP held LOW, verify SCLK/16 =
- * 6.000 MHz on a scope at PA8, and then set this back to 0 before
- * starting Stage B (TIM1 bring-up needs PA8 for its real function).
+ * DISABLED BY DEFAULT: PA8 is the pin this port uses for TMR1_CH1
+ * (MP6540HA HSA) from Stage B onward. Only enable this with MP6540HA
+ * definitely unpowered / nSLEEP held LOW, verify SCLK/16 = 6.000 MHz
+ * on a scope at PA8, and set this back to 0 afterward.
  */
 #define STAGE_A_ENABLE_CLKOUT 0
 
 volatile uint32_t stage_a_heartbeat;
 volatile int stage_a_clock_ok;
-
-/* CRM diagnostics, captured right after clock_config_96mhz() returns.
- * Register/field names below are exactly as vendored from Artery's own
- * at32f425_crm.h / system_at32f425.c -- none are guessed. */
-volatile uint32_t stage_a_crm_ctrl;   /* CRM->ctrl: hicken/hickstbl/pllen/pllstbl etc. */
-volatile uint32_t stage_a_crm_cfg;    /* CRM->cfg: sclksel/sclksts/ahbdiv/apb1div/apb2div/pllrcs/pllmult_l/pllmult_h */
-volatile uint32_t stage_a_crm_pll;    /* CRM->pll: pllms/pllns/pllfr/pllcfgen (fractional-N path, unused here) */
-volatile uint32_t stage_a_sysclk_status; /* crm_sysclk_switch_status_get() result: expect CRM_SCLK_PLL (2) */
-volatile uint32_t stage_a_pll_mult_decoded; /* pll_mult reconstructed the same way system_core_clock_update() does */
+volatile uint32_t stage_a_crm_ctrl;
+volatile uint32_t stage_a_crm_cfg;
+volatile uint32_t stage_a_crm_pll;
+volatile uint32_t stage_a_sysclk_status;
+volatile uint32_t stage_a_pll_mult_decoded;
 
 /*
  * vendor/startup_at32f425.s calls __libc_init_array (newlib), which
@@ -121,32 +108,9 @@ volatile uint32_t stage_a_pll_mult_decoded; /* pll_mult reconstructed the same w
 void _init(void) {}
 void _fini(void) {}
 
-static void clock_config_96mhz(void)
+int main(void)
 {
-  crm_reset();
-  flash_psr_set(FLASH_WAIT_CYCLE_2); /* required for 65~96MHz per datasheet Table 17 note */
-
-#if AT32F425_CLOCK_SOURCE_HEXT
-  crm_clock_source_enable(CRM_CLOCK_SOURCE_HEXT, TRUE);
-  while (crm_hext_stable_wait() == ERROR);
-  crm_pll_config(CRM_PLL_SOURCE_HEXT, CRM_PLL_MULT_12); /* HEXT(8MHz) x12 = 96MHz */
-#else
-  crm_clock_source_enable(CRM_CLOCK_SOURCE_HICK, TRUE);
-  while (crm_flag_get(CRM_HICK_STABLE_FLAG) != SET);
-  crm_pll_config(CRM_PLL_SOURCE_HICK, CRM_PLL_MULT_24); /* (HICK_VALUE/2=4MHz) x24 = 96MHz */
-#endif
-
-  crm_clock_source_enable(CRM_CLOCK_SOURCE_PLL, TRUE);
-  while (crm_flag_get(CRM_PLL_STABLE_FLAG) != SET);
-
-  crm_ahb_div_set(CRM_AHB_DIV_1);
-  crm_apb2_div_set(CRM_APB2_DIV_1);
-  crm_apb1_div_set(CRM_APB1_DIV_1);
-
-  crm_sysclk_switch(CRM_SCLK_PLL);
-  while (crm_sysclk_switch_status_get() != CRM_SCLK_PLL);
-
-  system_core_clock_update();
+  clock_config_96mhz();
 
 #if STAGE_A_ENABLE_CLKOUT
   crm_periph_clock_enable(CRM_GPIOA_PERIPH_CLOCK, TRUE);
@@ -154,33 +118,13 @@ static void clock_config_96mhz(void)
   crm_clkout_div_set(CRM_CLKOUT_DIV_16);
   crm_clock_out_set(CRM_CLKOUT_SCLK); /* expect 96MHz/16 = 6.000MHz on PA8 */
 #endif
-}
 
-static void capture_crm_diagnostics(void)
-{
-  stage_a_crm_ctrl = CRM->ctrl;
-  stage_a_crm_cfg = CRM->cfg;
-  stage_a_crm_pll = CRM->pll;
-  stage_a_sysclk_status = (uint32_t)crm_sysclk_switch_status_get();
-
-  /* Reproduce system_core_clock_update()'s pll_mult decode so it can be
-   * inspected directly, independent of system_core_clock itself. */
-  {
-    uint32_t pll_mult_l = CRM->cfg_bit.pllmult_l;
-    uint32_t pll_mult_h = CRM->cfg_bit.pllmult_h;
-    uint32_t pll_mult;
-    if ((pll_mult_h != 0U) || (pll_mult_l == 15U))
-      pll_mult = pll_mult_l + (16U * pll_mult_h) + 1U;
-    else
-      pll_mult = pll_mult_l + 2U;
-    stage_a_pll_mult_decoded = pll_mult;
-  }
-}
-
-int main(void)
-{
-  clock_config_96mhz();
-  capture_crm_diagnostics();
+  clock_capture_diagnostics();
+  stage_a_crm_ctrl = stage_crm_ctrl;
+  stage_a_crm_cfg = stage_crm_cfg;
+  stage_a_crm_pll = stage_crm_pll;
+  stage_a_sysclk_status = stage_sysclk_status;
+  stage_a_pll_mult_decoded = stage_pll_mult_decoded;
   stage_a_clock_ok = (system_core_clock == 96000000U);
 
   /* Prove the GPIO/AHB2 bus is reachable without driving any pin
