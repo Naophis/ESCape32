@@ -63,6 +63,20 @@
  * this" is an offline/visual analysis of the dumped trace (e.g. against
  * a known rotation direction), not something this firmware assumes.
  *
+ * NOT implemented here, deliberately, per explicit user instruction --
+ * recorded as requirements for the real (non-bring-up) implementation:
+ *   - The final MOUSEF425 firmware must NOT run all-3-phase zero-cross
+ *     checking all the time like this file does. It must only look at
+ *     the one floating phase implied by the current commutation
+ *     sector, against that sector's expected crossing polarity.
+ *   - The 100k-mechanical-RPM target cannot reuse this file's "3-ch
+ *     scan + ZC_CONFIRM_COUNT=3" timing as-is. PWM synchronization,
+ *     blanking, hysteresis, and end-to-end detection latency all need
+ *     to be re-derived for that regime, not carried over unchanged
+ *     from this passive bring-up test.
+ * Both points apply to the active-commutation integration stage, not
+ * to this file.
+ *
  * RAM trace buffer: BRING-UP ONLY. This ~12.5KB buffer exists purely
  * to pull a waveform out over OpenOCD on hardware with no scope/logic
  * analyzer available. It must NOT be carried into the eventual
@@ -94,8 +108,18 @@
 
 #define ZC_CONFIRM_COUNT 3
 
+/* Deadband/hysteresis around neutral: |diff| <= ZC_DEADBAND counts is
+ * treated as "still ambiguous" and does not update the candidate sign
+ * or reset its confirm-run (this is what stops a few counts of noise
+ * right at neutral from chattering the zero-cross state).
+ * PLACEHOLDER VALUE -- 8 counts (out of 4095 full-scale) is a generic
+ * starting guess, NOT derived from the user's captured stage_d_trace.bin.
+ * Re-tune this from the actual noise amplitude seen in the neutral
+ * region of that waveform before trusting it. */
+#define ZC_DEADBAND 8
+
 #define TRACE_LEN 800
-#define TRACE_DECIMATION 1024 /* log 1 in every N ADC scans */
+#define TRACE_DECIMATION 128 /* log 1 in every N ADC scans: ~3.25us*128 = ~416us/sample, 800pts = ~0.33s */
 
 typedef struct {
   uint32_t t_us;
@@ -116,31 +140,101 @@ volatile uint16_t stage_d_adc_a, stage_d_adc_b, stage_d_adc_c;
 volatile int32_t stage_d_neutral;
 volatile uint32_t stage_d_zc_count_a, stage_d_zc_count_b, stage_d_zc_count_c;
 
+/* Per-phase filter diagnostics, updated every UNDECIMATED raw scan
+ * (i.e. every ~3.25us DMA transfer-complete, same rate zc_filter_update()
+ * itself runs at -- not just the 128-decimated trace log rate). */
+volatile int32_t stage_d_diag_diff_min_a, stage_d_diag_diff_min_b, stage_d_diag_diff_min_c;
+volatile int32_t stage_d_diag_diff_max_a, stage_d_diag_diff_max_b, stage_d_diag_diff_max_c;
+volatile uint32_t stage_d_diag_high_cross_a, stage_d_diag_high_cross_b, stage_d_diag_high_cross_c; /* raw diff>=+H sample count */
+volatile uint32_t stage_d_diag_low_cross_a, stage_d_diag_low_cross_b, stage_d_diag_low_cross_c;     /* raw diff<=-H sample count */
+volatile int stage_d_diag_candidate_sign_a, stage_d_diag_candidate_sign_b, stage_d_diag_candidate_sign_c;
+volatile int stage_d_diag_confirmed_sign_a, stage_d_diag_confirmed_sign_b, stage_d_diag_confirmed_sign_c;
+volatile int stage_d_diag_confirm_run_a, stage_d_diag_confirm_run_b, stage_d_diag_confirm_run_c;
+
 void _init(void) {}
 void _fini(void) {}
 
 typedef struct {
-  int candidate_sign;
-  int confirmed_sign;
-  int confirm_run;
+  int confirmed_sign;  /* 0=unknown(bootstrap, treated as "low"), -1, +1 */
+  int candidate_sign;  /* diagnostic only: the sign the current run is testing for */
+  int confirm_run;     /* count of CONSECUTIVE qualifying raw samples so far */
+  int32_t diff_min, diff_max;
+  uint32_t high_cross, low_cross;
 } zc_filter_t;
 
-static zc_filter_t zc_a, zc_b, zc_c;
+static zc_filter_t zc_a = {.diff_min = 0x7fffffff, .diff_max = -0x7fffffff - 1};
+static zc_filter_t zc_b = {.diff_min = 0x7fffffff, .diff_max = -0x7fffffff - 1};
+static zc_filter_t zc_c = {.diff_min = 0x7fffffff, .diff_max = -0x7fffffff - 1};
 
-/* Returns 0=no new confirmed crossing, 1=confirmed rising, 2=confirmed falling. */
+/*
+ * Explicit Schmitt-trigger state machine (rewritten per user's exact
+ * spec after Stage D trace2.bin showed massive spurious/asymmetric
+ * crossing counts -- A=19568, B=77944, C=1 -- that the previous
+ * "deadband skips silently, no reset" version could produce).
+ *
+ * THE BUG in the previous version: a sample landing inside the
+ * deadband (or on the wrong side) just did `return 0` WITHOUT
+ * resetting confirm_run. That made "confirm_run reaches N" mean "N
+ * qualifying hits total since the last reset, with unlimited gaps
+ * allowed in between" -- NOT "N consecutive samples" as intended. A
+ * signal that only occasionally, sparsely pokes past the threshold
+ * (e.g. noise riding on a slowly-changing BEMF trend near the
+ * deadband boundary) could accumulate 3 such hits, spread across many
+ * scans with plenty of deadband/wrong-side samples interleaved, and
+ * still get "confirmed" -- which is not a real, coherent transition.
+ * That asymmetric-noise-sensitive accumulation is the leading
+ * candidate for A/B's inflated counts. It does NOT by itself explain
+ * C reading exactly 1 despite clearing the deadband (that could be
+ * the opposite failure mode: if C's raw diff flips sign almost every
+ * single 3.25us sample near a genuine zero-crossing, it may rarely
+ * produce even 3 truly consecutive same-side samples under a CORRECT
+ * consecutive-count rule either -- the new stage_d_diag_* fields below
+ * are there to tell the two apart from the next capture, rather than
+ * guessing further from here).
+ *
+ * Fix: any non-qualifying sample (deadband OR wrong side) now resets
+ * confirm_run to 0, so confirm_run truly only ever counts an unbroken
+ * consecutive run. Direction to test for is derived purely from the
+ * current confirmed_sign (confirmed=-1 or unknown -> watch for N
+ * consecutive diff>=+H to flip to +1; confirmed=+1 -> watch for N
+ * consecutive diff<=-H to flip to -1), matching the two cases the
+ * user specified.
+ *
+ * Returns 0=no new confirmed crossing, 1=confirmed rising (->+1),
+ * 2=confirmed falling (->-1).
+ */
 static int zc_filter_update(zc_filter_t *f, int32_t diff, volatile uint32_t *count)
 {
-  int sign = (diff >= 0) ? 1 : -1;
-  if (sign != f->candidate_sign) {
-    f->candidate_sign = sign;
-    f->confirm_run = 1;
-  } else if (f->confirm_run < ZC_CONFIRM_COUNT) {
-    f->confirm_run++;
+  int qualifies, new_sign;
+
+  if (diff < f->diff_min) f->diff_min = diff;
+  if (diff > f->diff_max) f->diff_max = diff;
+  if (diff >= ZC_DEADBAND) f->high_cross++;
+  if (diff <= -ZC_DEADBAND) f->low_cross++;
+
+  if (f->confirmed_sign <= 0) {
+    new_sign = 1;
+    qualifies = (diff >= ZC_DEADBAND);
+  } else {
+    new_sign = -1;
+    qualifies = (diff <= -ZC_DEADBAND);
   }
-  if (f->confirm_run == ZC_CONFIRM_COUNT && f->confirmed_sign != sign) {
-    f->confirmed_sign = sign;
-    (*count)++;
-    return sign > 0 ? 1 : 2;
+  f->candidate_sign = new_sign;
+
+  if (qualifies) {
+    if (f->confirm_run < ZC_CONFIRM_COUNT) f->confirm_run++;
+  } else {
+    f->confirm_run = 0; /* ANY non-qualifying sample breaks the consecutive run */
+  }
+
+  if (f->confirm_run >= ZC_CONFIRM_COUNT) {
+    f->confirm_run = 0;
+    int prev = f->confirmed_sign;
+    f->confirmed_sign = new_sign;
+    if (prev != new_sign) {
+      (*count)++;
+      return new_sign > 0 ? 1 : 2;
+    }
   }
   return 0;
 }
@@ -242,12 +336,36 @@ void DMA1_Channel1_IRQHandler(void)
 
     static uint8_t pending_event;
     int r;
+
     r = zc_filter_update(&zc_a, diff_a, &stage_d_zc_count_a);
     if (r) pending_event |= (r == 1) ? 0x01 : 0x02;
+    stage_d_diag_diff_min_a = zc_a.diff_min;
+    stage_d_diag_diff_max_a = zc_a.diff_max;
+    stage_d_diag_high_cross_a = zc_a.high_cross;
+    stage_d_diag_low_cross_a = zc_a.low_cross;
+    stage_d_diag_candidate_sign_a = zc_a.candidate_sign;
+    stage_d_diag_confirmed_sign_a = zc_a.confirmed_sign;
+    stage_d_diag_confirm_run_a = zc_a.confirm_run;
+
     r = zc_filter_update(&zc_b, diff_b, &stage_d_zc_count_b);
     if (r) pending_event |= (r == 1) ? 0x04 : 0x08;
+    stage_d_diag_diff_min_b = zc_b.diff_min;
+    stage_d_diag_diff_max_b = zc_b.diff_max;
+    stage_d_diag_high_cross_b = zc_b.high_cross;
+    stage_d_diag_low_cross_b = zc_b.low_cross;
+    stage_d_diag_candidate_sign_b = zc_b.candidate_sign;
+    stage_d_diag_confirmed_sign_b = zc_b.confirmed_sign;
+    stage_d_diag_confirm_run_b = zc_b.confirm_run;
+
     r = zc_filter_update(&zc_c, diff_c, &stage_d_zc_count_c);
     if (r) pending_event |= (r == 1) ? 0x10 : 0x20;
+    stage_d_diag_diff_min_c = zc_c.diff_min;
+    stage_d_diag_diff_max_c = zc_c.diff_max;
+    stage_d_diag_high_cross_c = zc_c.high_cross;
+    stage_d_diag_low_cross_c = zc_c.low_cross;
+    stage_d_diag_candidate_sign_c = zc_c.candidate_sign;
+    stage_d_diag_confirmed_sign_c = zc_c.confirmed_sign;
+    stage_d_diag_confirm_run_c = zc_c.confirm_run;
 
     stage_d_scan_count++;
 
