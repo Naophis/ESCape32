@@ -162,3 +162,5 @@ add_at32f425_bringup(MOUSEF425_STAGE_D_ACTIVE mcu/AT32F425/stage_d_active_main.c
 add_at32f425_bringup(MOUSEF425_STAGE_E mcu/AT32F425/stage_e_main.c)
 add_at32f425_bringup(MOUSEF425_STAGE_E2 mcu/AT32F425/stage_e2_main.c)
 add_at32f425_bringup(MOUSEF425_STAGE_E3 mcu/AT32F425/stage_e3_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E4 mcu/AT32F425/stage_e4_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E5 mcu/AT32F425/stage_e5_main.c)

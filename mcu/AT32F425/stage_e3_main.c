@@ -157,6 +157,24 @@ volatile uint32_t stage_e3_dma_error;
 volatile int stage_e3_zc_locked; /* 1 once this sector's expected crossing has been accepted */
 volatile uint32_t stage_e3_tim1_c4dt; /* ADC trigger point, for sanity-checking against ccr/arr */
 
+/* --- ADC-trigger-path debug diagnostics (added because the path
+ * produced zero scans in the first PWM-synchronized attempt) --- */
+volatile uint32_t stage_e3_tmr1_ch4_event_count; /* TMR1 CH4 compare-match IRQ count (independent of ADC) */
+volatile uint32_t stage_e3_adc_conversion_count; /* ADC1 "channels conversion end" (CCE) IRQ count */
+volatile uint32_t stage_e3_dma_fdt_count;        /* DMA1 channel1 full-data-transfer IRQ count */
+volatile uint32_t stage_e3_tmr1_cval;   /* TMR1->cval, live counter value */
+volatile uint32_t stage_e3_tmr1_ctrl1;  /* TMR1->ctrl1 raw (CEN/ARPE/direction etc.) */
+volatile uint32_t stage_e3_tmr1_cm2;    /* TMR1->cm2 raw (holds CH3/CH4 mode config) */
+volatile uint32_t stage_e3_tmr1_cctrl;  /* TMR1->cctrl raw (CCER-equivalent: enables/polarities incl. CH4) */
+volatile uint32_t stage_e3_tmr1_brk;    /* TMR1->brk raw (BDTR-equivalent: dtc/brken/aoen/moen) */
+volatile uint32_t stage_e3_adc_ctrl1;   /* ADC1->ctrl1 raw */
+volatile uint32_t stage_e3_adc_ctrl2;   /* ADC1->ctrl2 raw: octesel_l (trigger source)/octen (trigger enable)/rpen (repeat) */
+volatile uint32_t stage_e3_adc_osq1;    /* ADC1->osq1 raw: ordinary sequence length + high-order channel slots */
+volatile uint32_t stage_e3_adc_osq2;    /* ADC1->osq2 raw */
+volatile uint32_t stage_e3_adc_osq3;    /* ADC1->osq3 raw: ordinary sequence slots 1-3 (our A/B/C order) */
+volatile uint32_t stage_e3_dma_ch1_ctrl; /* DMA1_CHANNEL1->ctrl raw: chen (channel enable) etc. */
+volatile uint32_t stage_e3_dma_sts;      /* DMA1->sts raw: global per-channel status flags */
+
 void _init(void) {}
 void _fini(void) {}
 
@@ -279,15 +297,56 @@ static void tim1_adc_trigger_config(uint16_t duty_ccr)
   tmr_output_config_type oc;
   uint16_t ccr4 = (uint16_t)(duty_ccr + BLANK_AFTER_EDGE_US * TIM1_TICKS_PER_US);
 
+  /*
+   * BUG FIX: oc_output_state was FALSE here ("internal event only, no
+   * GPIO to drive"). That reasoning about the GPIO was correct (CH4
+   * has no pin on this QFN32 package's TMR1 mapping) but wrong about
+   * its effect on the register: tmr_output_channel_config() maps
+   * oc_output_state directly onto cctrl's c4en bit (see the driver's
+   * own implementation), and c4en is what the ADC's external-trigger
+   * hardware actually looks at -- NOT the same signal path as the CC4
+   * compare-match flag/interrupt (which is why
+   * stage_e3_tmr1_ch4_event_count was already incrementing normally
+   * even with c4en=0: the flag/IRQ and the peripheral-trigger-bus
+   * signal are gated separately). Artery's own official example
+   * (adc/tmr_trigger_automatic_preempted) sets oc_output_state=TRUE
+   * for exactly this CH4-as-ADC-trigger use even though that example
+   * also doesn't care about the pin -- confirms this is required, not
+   * a pin-driving side effect to avoid.
+   */
   tmr_output_default_para_init(&oc);
   oc.oc_mode = TMR_OUTPUT_CONTROL_PWM_MODE_A;
-  oc.oc_output_state = FALSE; /* internal event only, not brought out on this package anyway */
+  oc.oc_output_state = TRUE; /* required for c4en -- see above; no physical pin is affected */
   oc.oc_polarity = TMR_OUTPUT_ACTIVE_HIGH;
   oc.oc_idle_state = FALSE;
   tmr_output_channel_config(TMR1, TMR_SELECT_CHANNEL_4, &oc);
   tmr_channel_value_set(TMR1, TMR_SELECT_CHANNEL_4, ccr4);
+  tmr_channel_enable(TMR1, TMR_SELECT_CHANNEL_4, TRUE); /* explicit, belt-and-suspenders on top of oc_output_state */
+  /* CCPC (tmr_channel_buffer_enable, set in tim1_init()) means the
+   * cctrl/cm2 writes above landed in shadow registers -- commit them
+   * now instead of relying on apply_step(0,...)'s later commit to
+   * also happen to flush this. */
+  tmr_event_sw_trigger(TMR1, TMR_OVERFLOW_SWTRIG | TMR_HALL_SWTRIG);
+
+  /* Debug-only: count CH4 compare-match events independent of the ADC,
+   * to answer "does the compare event itself even happen" (diagnosis
+   * step 1) regardless of whether the ADC ever reacts to it. */
+  nvic_irq_enable(TMR1_CH_IRQn, 2, 0);
+  tmr_interrupt_enable(TMR1, TMR_C4_INT, TRUE);
 
   stage_e3_tim1_c4dt = ccr4;
+}
+
+/* TMR1_CH_IRQn is the combined capture/compare IRQ for TMR1 CH1-4 on
+ * this part (see porting-plan Section 18-E: F425 combines what F421
+ * split across separate CC IRQs into one). We only enabled CH4's
+ * interrupt above, so any event here is CH4. */
+void TMR1_CH_IRQHandler(void)
+{
+  if (tmr_flag_get(TMR1, TMR_C4_FLAG) != RESET) {
+    tmr_flag_clear(TMR1, TMR_C4_FLAG);
+    stage_e3_tmr1_ch4_event_count++;
+  }
 }
 
 static void apply_step(int idx, uint16_t duty_ccr)
@@ -466,7 +525,24 @@ static void adc_config(void)
 
   adc_base_default_para_init(&b);
   b.sequence_mode = TRUE;
-  b.repeat_mode = TRUE;
+  /*
+   * BUG FIX: this was TRUE, copied from Stage C/D's free-running/
+   * software-triggered setup. repeat_mode maps directly to ADC1's
+   * ctrl2.rpen bit (confirmed in Artery's own adc_base_config()
+   * source), which means "keep converting continuously without
+   * needing a new trigger" -- appropriate for software-triggered
+   * free-running (Stage C/D), but WRONG for an externally-triggered
+   * ADC: with rpen=1 the ADC is already busy running its own internal
+   * loop and never gets into a state where it is waiting for (or
+   * reacts to) the TMR1_CH4 external trigger event, which is exactly
+   * consistent with the observed symptom (zero DMA transfers, zero
+   * ADC activity at all, from a real TMR1_CH4 that -- once instrumented
+   * -- can be checked separately via stage_e3_tmr1_ch4_event_count).
+   * Confirmed against Artery's own official example
+   * (adc/tmr_trigger_automatic_preempted), which uses this exact
+   * ADC12_ORDINARY_TRIG_TMR1CH4 trigger with repeat_mode=FALSE.
+   */
+  b.repeat_mode = FALSE;
   b.data_align = ADC_RIGHT_ALIGNMENT;
   b.ordinary_channel_length = 3;
   adc_base_config(ADC1, &b);
@@ -478,6 +554,12 @@ static void adc_config(void)
   adc_ordinary_conversion_trigger_set(ADC1, ADC12_ORDINARY_TRIG_TMR1CH4, TRUE);
   adc_dma_mode_enable(ADC1, TRUE);
 
+  /* Debug-only: count completed ordinary sequences independent of DMA,
+   * to answer "did the ADC itself finish converting" (diagnosis step 3)
+   * even if DMA turns out to be the broken link instead. */
+  nvic_irq_enable(ADC1_IRQn, 2, 0);
+  adc_interrupt_enable(ADC1, ADC_CCE_INT, TRUE);
+
   adc_enable(ADC1, TRUE);
 
   adc_calibration_init(ADC1);
@@ -486,10 +568,19 @@ static void adc_config(void)
   while (adc_calibration_status_get(ADC1));
 }
 
+void ADC1_IRQHandler(void)
+{
+  if (adc_interrupt_flag_get(ADC1, ADC_CCE_FLAG) != RESET) {
+    adc_flag_clear(ADC1, ADC_CCE_FLAG);
+    stage_e3_adc_conversion_count++;
+  }
+}
+
 void DMA1_Channel1_IRQHandler(void)
 {
   if (dma_interrupt_flag_get(DMA1_FDT1_FLAG) != RESET) {
     dma_flag_clear(DMA1_FDT1_FLAG);
+    stage_e3_dma_fdt_count++;
 
     uint16_t a = adc_buf[0], b = adc_buf[1], c = adc_buf[2];
     int32_t neutral = ((int32_t)a + (int32_t)b + (int32_t)c) / 3;
@@ -587,6 +678,21 @@ int main(void)
   tmr_counter_enable(TMR3, TRUE);
 
   for (;;) {
+    /* Cheap register-dump refresh for OpenOCD inspection at any time
+     * (not just at a precise halt), per the requested diagnostics. */
+    stage_e3_tmr1_cval = TMR1->cval;
+    stage_e3_tmr1_ctrl1 = TMR1->ctrl1;
+    stage_e3_tmr1_cm2 = TMR1->cm2;
+    stage_e3_tmr1_cctrl = TMR1->cctrl;
+    stage_e3_tmr1_brk = TMR1->brk;
+    stage_e3_adc_ctrl1 = ADC1->ctrl1;
+    stage_e3_adc_ctrl2 = ADC1->ctrl2;
+    stage_e3_adc_osq1 = ADC1->osq1;
+    stage_e3_adc_osq2 = ADC1->osq2;
+    stage_e3_adc_osq3 = ADC1->osq3;
+    stage_e3_dma_ch1_ctrl = DMA1_CHANNEL1->ctrl;
+    stage_e3_dma_sts = DMA1->sts;
+
     ++stage_e3_heartbeat;
   }
 }
