@@ -109,9 +109,13 @@
  * plain linear extension of the same TMR3-overflow-driven commutation
  * Stage E2/E6 always used -- nothing structural changed.
  */
+/*
+ * Restricted to 15..3ms for the first real-motor re-test after the
+ * MUX fix (stall-avoidance per instruction) -- the 2/1.5/1.0/0.75/0.5ms
+ * entries are held back until this range is confirmed healthy.
+ */
 static const uint32_t bucket_period_ticks[] = {
-  1500, 1300, 1100, 900, 700, 600, 500, /* 15,13,11,9,7,6,5 ms -- unchanged floor */
-  400, 300, 200, 150, 100, 75, 50       /* 4,3,2,1.5,1.0,0.75,0.5 ms -- NEW */
+  1500, 1300, 1100, 900, 700, 600, 500, 400, 300 /* 15,13,11,9,7,6,5,4,3 ms */
 };
 #define NUM_BUCKETS (sizeof(bucket_period_ticks) / sizeof(bucket_period_ticks[0]))
 #define STEPS_PER_BUCKET 40u
@@ -179,26 +183,49 @@ typedef struct {
   /* --- new in Stage E15: when within the sector a confirmed ZC lands --- */
   uint32_t zc_delay_us_min, zc_delay_us_max;
   uint32_t zc_delay_us_sum; /* / (zc_rising+zc_falling) for mean */
+  /*
+   * Undecided-sector breakdown, per follow-up instruction: armed_count
+   * = sectors that reached ARMED_RISING/ARMED_FALLING at all (baseline
+   * cleared the deadband on one side), confirmed_count = subset of
+   * those that actually crossed to the opposite threshold (==
+   * zc_rising+zc_falling), never_armed_count = step_count-armed_count
+   * (stayed inside the deadband the whole sector -- distinct failure
+   * mode from "armed but never crossed").
+   */
+  uint32_t armed_count;
+  uint32_t confirmed_count;
+  uint32_t never_armed_count;
 } stage_e15_bucket_t;
 
 stage_e15_bucket_t stage_e15_results[NUM_BUCKETS];
 volatile uint32_t stage_e15_bucket_index;
 
-/* Accumulated across the WHOLE run (all buckets), indexed by step_idx
- * (0-5). Still recorded as a diagnostic, same as Stage E14, but NOT
- * used to seed an expected_dir table in this file -- per instruction,
- * that derivation waits until the ZC-classification redesign itself
- * (this file) is validated against real BEMF timing (zc_delay), not
- * transient timing. */
+/*
+ * Now PER BUCKET (speed), not global, per follow-up instruction --
+ * [bucket][step_idx 0-5]. Still recorded as a diagnostic, NOT used to
+ * seed an expected_dir table in this file -- that derivation waits
+ * until confirmed ZC is shown to occur across all 6 sectors (not just
+ * the MUX-bug-era sector1/2) with a plausible mid-sector delay
+ * distribution.
+ */
 typedef struct { uint32_t rising, falling; } stage_e15_dir_hist_entry_t;
-stage_e15_dir_hist_entry_t stage_e15_dir_hist[6];
+stage_e15_dir_hist_entry_t stage_e15_dir_hist[NUM_BUCKETS][6];
 
-/* Ratio-of-sector-period histogram for confirmed ZC delay, accumulated
- * globally across the whole run (bin i = [i/10, (i+1)/10) of
- * zc_delay_us/period_us). A real BEMF crossing should cluster near the
- * middle bins regardless of speed; a transient-driven false confirm
- * clusters near bin 0. */
-volatile uint32_t stage_e15_zc_delay_hist[ZC_DELAY_HIST_BINS];
+/* confirmed_count per [bucket][step_idx 0-5] -- the per-sector
+ * breakdown of stage_e15_bucket_t.confirmed_count (=rising+falling for
+ * the WHOLE bucket); this is what directly answers "does sector0-5 all
+ * get confirmed ZC now, not just sector1/2". */
+volatile uint32_t stage_e15_confirmed_count_by_sector[NUM_BUCKETS][6];
+
+/*
+ * Ratio-of-sector-period histogram for confirmed ZC delay, now PER
+ * BUCKET (not global, per follow-up instruction) so the delay-ratio
+ * distribution can be compared speed-to-speed: [bucket][bin], bin i =
+ * [i/10, (i+1)/10) of zc_delay_us/period_us. A real BEMF crossing
+ * should cluster near the middle bins regardless of speed; a
+ * transient-driven false confirm clusters near bin 0.
+ */
+volatile uint32_t stage_e15_zc_delay_hist[NUM_BUCKETS][ZC_DELAY_HIST_BINS];
 
 volatile uint32_t stage_e15_heartbeat;
 volatile int stage_e15_running;
@@ -314,10 +341,13 @@ static void tim1_pins_to_af(void)
   g.gpio_pins = GPIO_PINS_0 | GPIO_PINS_1;
   gpio_init(GPIOB, &g);
 
+  /* PA7/PB0/PB1 corrected to MUX_2 per AT32F425 official GPIO IOMUX
+   * table (user-confirmed) -- the previous MUX_3/MUX_1 values were
+   * never independently verified and were wrong (Stage E15B/E15C). */
   gpio_pin_mux_config(GPIOA, GPIO_PINS_SOURCE8, GPIO_MUX_2);  /* CH1  */
-  gpio_pin_mux_config(GPIOA, GPIO_PINS_SOURCE7, GPIO_MUX_3);  /* CH1C */
+  gpio_pin_mux_config(GPIOA, GPIO_PINS_SOURCE7, GPIO_MUX_2);  /* CH1C */
   gpio_pin_mux_config(GPIOA, GPIO_PINS_SOURCE9, GPIO_MUX_2);  /* CH2  */
-  gpio_pin_mux_config(GPIOB, GPIO_PINS_SOURCE0, GPIO_MUX_1);  /* CH2C */
+  gpio_pin_mux_config(GPIOB, GPIO_PINS_SOURCE0, GPIO_MUX_2);  /* CH2C */
   gpio_pin_mux_config(GPIOA, GPIO_PINS_SOURCE10, GPIO_MUX_2); /* CH3  */
   gpio_pin_mux_config(GPIOB, GPIO_PINS_SOURCE1, GPIO_MUX_2);  /* CH3C */
 }
@@ -446,6 +476,7 @@ static void stop_and_force_off(void)
 }
 
 static uint32_t bucket_zc_delay_us_min, bucket_zc_delay_us_max, bucket_zc_delay_us_sum;
+static uint32_t bucket_armed_count;
 
 static void reset_bucket_accumulator(void)
 {
@@ -458,6 +489,7 @@ static void reset_bucket_accumulator(void)
   bucket_zc_delay_us_min = 0xffffffffu;
   bucket_zc_delay_us_max = 0;
   bucket_zc_delay_us_sum = 0;
+  bucket_armed_count = 0;
 }
 
 static uint32_t bucket_step_count;
@@ -484,6 +516,9 @@ static void snapshot_bucket(uint32_t idx)
   r->zc_delay_us_min = (bucket_zc_delay_us_min == 0xffffffffu) ? 0 : bucket_zc_delay_us_min;
   r->zc_delay_us_max = bucket_zc_delay_us_max;
   r->zc_delay_us_sum = bucket_zc_delay_us_sum;
+  r->armed_count = bucket_armed_count;
+  r->confirmed_count = stage_e15_zc_rising_count + stage_e15_zc_falling_count;
+  r->never_armed_count = bucket_step_count - bucket_armed_count;
 }
 
 static void start_bucket(uint32_t idx)
@@ -668,10 +703,12 @@ void DMA1_Channel1_IRQHandler(void)
               stage_e15_zc_arm_state = ZC_ARMED_RISING;
               zc_active.confirmed_sign = -1; /* armed: only a rising (r==1) confirm is possible */
               zc_active.confirm_run = 0;
+              bucket_armed_count++;
             } else if (diff >= ZC_DEADBAND) {
               stage_e15_zc_arm_state = ZC_ARMED_FALLING;
               zc_active.confirmed_sign = 1; /* armed: only a falling (r==2) confirm is possible */
               zc_active.confirm_run = 0;
+              bucket_armed_count++;
             }
             /* else: baseline still ambiguous (inside the deadband) -- stay UNARMED */
           } else {
@@ -683,8 +720,18 @@ void DMA1_Channel1_IRQHandler(void)
             if (confirmed_dir) {
               stage_e15_zc_locked = 1;
 
+              /*
+               * TMR2 wraps at 16 bits; sector periods (max 15ms
+               * nominal) are far under the 65.536ms wrap period, so a
+               * mod-2^16 difference is the correct and sufficient way
+               * to compute this short interval regardless of how many
+               * times the physical counter has wrapped since boot --
+               * a plain 32-bit subtraction of two raw cval readings is
+               * NOT safe (start near 65535, now just past a wrap back
+               * near 0 produces a huge near-UINT32_MAX result).
+               */
               uint32_t now_us = TMR2->cval;
-              uint32_t delay_us = now_us - stage_e15_step_start_us; /* unsigned subtraction, wrap-safe */
+              uint32_t delay_us = (uint32_t)(uint16_t)(now_us - stage_e15_step_start_us);
               stage_e15_zc_delay_us_last = delay_us;
               if (delay_us < bucket_zc_delay_us_min) bucket_zc_delay_us_min = delay_us;
               if (delay_us > bucket_zc_delay_us_max) bucket_zc_delay_us_max = delay_us;
@@ -693,14 +740,16 @@ void DMA1_Channel1_IRQHandler(void)
               uint32_t period_us = stage_e15_current_step_period_us;
               uint32_t bin = period_us ? (uint32_t)(((uint64_t)delay_us * ZC_DELAY_HIST_BINS) / period_us) : 0;
               if (bin >= ZC_DELAY_HIST_BINS) bin = ZC_DELAY_HIST_BINS - 1;
-              stage_e15_zc_delay_hist[bin]++;
+              stage_e15_zc_delay_hist[stage_e15_bucket_index][bin]++;
+
+              stage_e15_confirmed_count_by_sector[stage_e15_bucket_index][stage_e15_step_index]++;
 
               if (confirmed_dir == 1) {
                 stage_e15_zc_rising_count++;
-                stage_e15_dir_hist[stage_e15_step_index].rising++;
+                stage_e15_dir_hist[stage_e15_bucket_index][stage_e15_step_index].rising++;
               } else {
                 stage_e15_zc_falling_count++;
-                stage_e15_dir_hist[stage_e15_step_index].falling++;
+                stage_e15_dir_hist[stage_e15_bucket_index][stage_e15_step_index].falling++;
               }
             }
           }
