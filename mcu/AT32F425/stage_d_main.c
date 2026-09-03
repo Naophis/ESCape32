@@ -13,34 +13,36 @@
  * there are no switching edges to dodge). That draft is kept as
  * stage_d_active_main.c for re-use once real commutation starts.
  *
- * BENCH SETUP for this passive test (corrected per explicit user
- * instruction -- do NOT leave MP6540HA's VIN unpowered/0V):
+ * BENCH SETUP for this passive test:
  *   - MP6540HA VIN: NORMAL supply voltage, powered as usual.
- *   - MP6540HA nSLEEP: held LOW (driver asleep -> HSx/LSx driver
- *     outputs go/stay high-Z on their own, by design of the part,
- *     regardless of what logic level appears on the HSx/LSx inputs).
- *   - TIM1/PWM: not used at all in this file (see below).
+ *   - MP6540HA nSLEEP: HARDWIRED HIGH on this board (confirmed by the
+ *     user -- there is no MCU control of nSLEEP, and there never will
+ *     be for this design). The driver is therefore ALWAYS awake and
+ *     its HSx/LSx outputs directly follow whatever logic level the
+ *     MCU pins present -- nSLEEP provides NO automatic high-Z
+ *     protection here. (An earlier version of this file assumed
+ *     nSLEEP=LOW would do that job and left PA7/PA8/PA9/PA10/PB0/PB1
+ *     untouched/floating -- that assumption was wrong for this board
+ *     and has been corrected below: this firmware now actively drives
+ *     all six HSx/LSx inputs LOW itself.)
+ *   - PA7/PA8/PA9/PA10/PB0/PB1: driven to a DEFINED GPIO-output LOW
+ *     state at startup, before anything else -- HSx=L, LSx=L on every
+ *     leg gives MP6540HA's documented all-off/high-Z output state.
+ *     TIM1/PWM is not used at all in this file.
  *   Rationale: if VIN were left at 0V while the hand-spun motor
  *   generates BEMF, that voltage can forward-bias the power MOSFETs'
  *   body diodes back into the (unpowered, low-impedance-looking) VIN
  *   rail, clamping/rectifying the phase waveform and corrupting
- *   exactly the passive BEMF shape this test exists to capture. With
- *   VIN powered normally and nSLEEP=LOW, the driver's own high-Z
- *   output stage is what keeps all six FETs off -- not this firmware
- *   driving logic levels into HSx/LSx and hoping the FETs stay off
- *   while VIN sits at an undefined potential.
+ *   exactly the passive BEMF shape this test exists to capture -- so
+ *   VIN must be powered normally, not 0V, even though nothing is
+ *   being commanded to drive the motor.
  *   IDEALLY: physically disconnect the motor phase wires from the
  *   power stage entirely and connect only the three 15k/3k ADC-divider
  *   taps directly to the motor leads. That removes MP6540HA (and its
  *   FETs' body diodes) from the signal path altogether -- the cleanest
- *   possible passive BEMF measurement. Use the VIN-powered/nSLEEP=LOW
- *   setup above when that physical disconnection isn't practical.
- *
- * Because nSLEEP now does this job at the driver level, this firmware
- * does NOT drive PA7/PA8/PA9/PA10/PB0/PB1 to any defined logic level
- * on purpose (no TIM1 setup, no plain-GPIO-low drive either) -- it
- * simply never touches them, leaving MP6540HA's HSx/LSx inputs exactly
- * as unconstrained as the sleeping driver already ignores them.
+ *   possible passive BEMF measurement. Use the VIN-powered/all-six-
+ *   pins-LOW setup above when that physical disconnection isn't
+ *   practical.
  *
  * ADC: continuous free-running 3-channel scan (no PWM to synchronize
  * to), same pin/channel mapping as Stage C/D-active:
@@ -239,6 +241,41 @@ static int zc_filter_update(zc_filter_t *f, int32_t diff, volatile uint32_t *cou
   return 0;
 }
 
+/* Drive PA7/PA8/PA9/PA10/PB0/PB1 (-> MP6540HA HSA/LSA/HSB/LSB/HSC/LSC)
+ * to a DEFINED GPIO-output LOW state. nSLEEP is hardwired HIGH on this
+ * board (confirmed by the user), so the driver is always awake and
+ * provides no automatic high-Z protection -- this firmware must
+ * itself guarantee HSx=L/LSx=L on every leg (MP6540HA's documented
+ * all-off state) before anything else happens. No TIM1 involvement in
+ * this passive sub-stage. */
+static void gate_pins_force_off(void)
+{
+  gpio_init_type g;
+
+  crm_periph_clock_enable(CRM_GPIOA_PERIPH_CLOCK, TRUE);
+  crm_periph_clock_enable(CRM_GPIOB_PERIPH_CLOCK, TRUE);
+
+  gpio_bits_reset(GPIOA, GPIO_PINS_7 | GPIO_PINS_8 | GPIO_PINS_9 | GPIO_PINS_10);
+  gpio_bits_reset(GPIOB, GPIO_PINS_0 | GPIO_PINS_1);
+
+  gpio_default_para_init(&g);
+  g.gpio_mode = GPIO_MODE_OUTPUT;
+  g.gpio_out_type = GPIO_OUTPUT_PUSH_PULL;
+  g.gpio_pull = GPIO_PULL_NONE;
+  g.gpio_drive_strength = GPIO_DRIVE_STRENGTH_STRONGER;
+
+  g.gpio_pins = GPIO_PINS_7 | GPIO_PINS_8 | GPIO_PINS_9 | GPIO_PINS_10;
+  gpio_init(GPIOA, &g);
+  g.gpio_pins = GPIO_PINS_0 | GPIO_PINS_1;
+  gpio_init(GPIOB, &g);
+
+  /* Re-assert low after switching to output mode (mode change itself
+   * doesn't glitch the ODR bit, but this makes the "all off" intent
+   * explicit and independent of ODR's power-on-reset value). */
+  gpio_bits_reset(GPIOA, GPIO_PINS_7 | GPIO_PINS_8 | GPIO_PINS_9 | GPIO_PINS_10);
+  gpio_bits_reset(GPIOB, GPIO_PINS_0 | GPIO_PINS_1);
+}
+
 /* TMR2: free-running 1us-resolution timestamp counter, independent of
  * ADC scan timing jitter. TMR2 is 32-bit (Table 4), so this wraps only
  * every ~71.6 minutes -- not a concern for a hand-spin test. */
@@ -393,10 +430,7 @@ int main(void)
   clock_config_96mhz();
 
   nvic_priority_group_config(NVIC_PRIORITY_GROUP_4);
-  /* PA7/PA8/PA9/PA10/PB0/PB1 intentionally untouched -- see the file
-   * header: nSLEEP=LOW (or physical disconnection) is what keeps
-   * MP6540HA's outputs high-Z here, not this firmware driving logic
-   * levels into HSx/LSx. */
+  gate_pins_force_off(); /* first thing: guarantee HSx=L/LSx=L before anything else */
   timestamp_timer_config();
   adc_gpio_config();
   dma_config();

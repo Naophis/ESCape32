@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build + flash one of the AT32F425 bring-up stages via ST-Link/OpenOCD.
 #
-# Usage: mcu/AT32F425/flash.sh [A|B|C|D] [--build-only] [--no-reset]
-#   A|B|C|D   which stage to build/flash (default: D, the most recent one)
+# Usage: mcu/AT32F425/flash.sh [A|B|C|D|E] [--build-only] [--no-reset]
+#   A|B|C|D|E which stage to build/flash (default: E, the most recent one)
 #   --build-only  build only, don't touch the debugger/hardware
 #   --no-reset    program+verify but don't reset-and-run afterward
 #                 (leaves the target halted, useful before an OpenOCD/GDB
@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BUILD_DIR="$REPO_ROOT/build"
 
-STAGE="D"
+STAGE="E"
 BUILD_ONLY=0
 RESET_AFTER=1
 
@@ -29,6 +29,7 @@ for arg in "$@"; do
 		B|b) STAGE="B" ;;
 		C|c) STAGE="C" ;;
 		D|d) STAGE="D" ;;
+		E|e) STAGE="E" ;;
 		--build-only) BUILD_ONLY=1 ;;
 		--no-reset) RESET_AFTER=0 ;;
 		-h|--help)
