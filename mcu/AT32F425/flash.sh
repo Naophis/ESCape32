@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # Build + flash one of the AT32F425 bring-up stages via ST-Link/OpenOCD.
 #
-# Usage: mcu/AT32F425/flash.sh [A|B|C|D|E] [--build-only] [--no-reset]
-#   A|B|C|D|E which stage to build/flash (default: E, the most recent one)
+# Usage: mcu/AT32F425/flash.sh [A|B|C|D|E|E2|E3] [--build-only] [--no-reset]
+#   A|B|C|D|E|E2|E3  which stage to build/flash (default: E3, the most recent one)
 #   --build-only  build only, don't touch the debugger/hardware
 #   --no-reset    program+verify but don't reset-and-run afterward
 #                 (leaves the target halted, useful before an OpenOCD/GDB
 #                 session so you don't race the firmware's early init)
 #
-# Requires an OpenOCD build with Artery AT32F4x support (target/artery/
-# at32f4x.cfg) -- the stock distro package usually does NOT have this.
-# Override with OPENOCD=/path/to/openocd if needed; this script defaults
-# to the AT32F4x-capable build already present on this machine.
+# Requires an OpenOCD build with Artery AT32F4x support. Override with
+# OPENOCD=/path/to/openocd if needed; this script defaults to the
+# AT32F4x-capable build already present on this machine.
+#
+# Uses the repo-local mcu/AT32F425/openocd_at32f425.cfg (verified working
+# on real hardware) instead of the generic target/artery/at32f4x.cfg.
+# Do not switch this back to a /tmp-based config -- those don't survive
+# reboots.
 
 set -euo pipefail
 
@@ -19,7 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BUILD_DIR="$REPO_ROOT/build"
 
-STAGE="E"
+STAGE="E3"
 BUILD_ONLY=0
 RESET_AFTER=1
 
@@ -30,6 +34,8 @@ for arg in "$@"; do
 		C|c) STAGE="C" ;;
 		D|d) STAGE="D" ;;
 		E|e) STAGE="E" ;;
+		E2|e2) STAGE="E2" ;;
+		E3|e3) STAGE="E3" ;;
 		--build-only) BUILD_ONLY=1 ;;
 		--no-reset) RESET_AFTER=0 ;;
 		-h|--help)
@@ -47,8 +53,8 @@ TARGET="MOUSEF425_STAGE_${STAGE}"
 ELF="$BUILD_DIR/${TARGET}-rev17.1.elf"
 
 : "${OPENOCD:=/home/naoto/tools/openocd-install/bin/openocd}"
-INTERFACE_CFG="interface/stlink.cfg"
-TARGET_CFG="target/artery/at32f4x.cfg"
+OPENOCD_SCRIPTS="${OPENOCD_SCRIPTS:-/home/naoto/tools/openocd-install/share/openocd/scripts}"
+BOARD_CFG="$SCRIPT_DIR/openocd_at32f425.cfg"
 
 echo "==> Building ${TARGET}"
 if [ ! -d "$BUILD_DIR" ]; then
@@ -64,17 +70,22 @@ fi
 
 if [ ! -x "$OPENOCD" ]; then
 	echo "OpenOCD not found/executable at: $OPENOCD" >&2
-	echo "Set OPENOCD=/path/to/openocd (must support target/artery/at32f4x.cfg)." >&2
+	echo "Set OPENOCD=/path/to/openocd (must support AT32F4x via artery flash driver)." >&2
+	exit 1
+fi
+
+if [ ! -f "$BOARD_CFG" ]; then
+	echo "Board config not found: $BOARD_CFG" >&2
 	exit 1
 fi
 
 RESET_CMD="reset"
 [ "$RESET_AFTER" -eq 0 ] && RESET_CMD=""
 
-echo "==> Flashing ${ELF} via OpenOCD (ST-Link + AT32F4x)"
+echo "==> Flashing ${ELF} via OpenOCD (ST-Link + AT32F425, $BOARD_CFG)"
 "$OPENOCD" \
-	-f "$INTERFACE_CFG" \
-	-f "$TARGET_CFG" \
+	-s "$OPENOCD_SCRIPTS" \
+	-f "$BOARD_CFG" \
 	-c "program \"$ELF\" verify $RESET_CMD exit"
 
 echo "==> Done."

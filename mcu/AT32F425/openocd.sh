@@ -17,14 +17,18 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 : "${OPENOCD:=/home/naoto/tools/openocd-install/bin/openocd}"
+OPENOCD_SCRIPTS="${OPENOCD_SCRIPTS:-/home/naoto/tools/openocd-install/share/openocd/scripts}"
+BOARD_CFG="$SCRIPT_DIR/openocd_at32f425.cfg"
 
 if [ ! -x "$OPENOCD" ]; then
 	echo "OpenOCD not found/executable at: $OPENOCD" >&2
-	echo "Set OPENOCD=/path/to/openocd (must support target/artery/at32f4x.cfg)." >&2
+	echo "Set OPENOCD=/path/to/openocd (must support AT32F4x via artery flash driver)." >&2
 	exit 1
 fi
 
 exec "$OPENOCD" \
-	-f interface/stlink.cfg \
-	-f target/artery/at32f4x.cfg
+	-s "$OPENOCD_SCRIPTS" \
+	-f "$BOARD_CFG"
