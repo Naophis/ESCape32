@@ -23,7 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BUILD_DIR="$REPO_ROOT/build"
 
-STAGE="E9"
+STAGE="E11"
 BUILD_ONLY=0
 RESET_AFTER=1
 
@@ -42,6 +42,8 @@ for arg in "$@"; do
 		E7|e7) STAGE="E7" ;;
 		E8|e8) STAGE="E8" ;;
 		E9|e9) STAGE="E9" ;;
+		E10|e10) STAGE="E10" ;;
+		E11|e11) STAGE="E11" ;;
 		--build-only) BUILD_ONLY=1 ;;
 		--no-reset) RESET_AFTER=0 ;;
 		-h|--help)
