@@ -132,9 +132,20 @@
 // writes) for now.
 void at32_iftim_cr1_write(uint32_t v);
 void at32_iftim_reset(void);
+void at32_iftim_ocr_write(uint32_t v);
 #define IFTIM_CR1_WRITE(v) at32_iftim_cr1_write(v)
 #define IFTIM_ARR_WRITE(v) ((void)(v))
 #define IFTIM_RESET() at32_iftim_reset()
+// Writing IFTIM_OCR is what ARMS the next commutation on a single-IFTIM
+// backend (the timer's own compare event fires it). Here the commutation
+// event comes from TIM3 instead, so the new target has to be pushed into
+// TIM3 explicitly on every write -- without this, upstream's own
+// sine-startup microstep pacing (nextstep()'s sine branch writes
+// IFTIM_OCR once per microstep and expects the commutation to follow at
+// exactly that interval) never reaches the scheduler at all, and
+// microsteps only advance at TIM7's 32.767ms timeout rate, which on real
+// hardware is a standing vibration instead of rotation.
+#define IFTIM_OCR_WRITE(v) at32_iftim_ocr_write(v)
 
 #define tim1_com_isr tim1_brk_up_trg_com_isr
 

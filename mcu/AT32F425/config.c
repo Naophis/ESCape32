@@ -238,49 +238,45 @@ void at32_hardfault_capture(void) {
 
 #ifdef BENCH_TEST
 // Read-only diagnostic visibility into upstream's iftim_isr() accept/
-// reject decision (src/main.c: `if (t < ival >> 1) return;`) and its
-// sine-startup ramp state -- step/ival/sine had `static` removed
-// (main.c, zero behavior change) specifically for this. The algorithm
-// itself is not touched anywhere. ertm/erpm are already non-static
-// (src/common.h) and need no change.
+// reject decision (src/main.c: `if (t < ival >> 1) return;`), its
+// sine-startup ramp state, and its own erpm-based duty release gate
+// (`if (sync < 6) return;`, nextstep()) -- step/ival/sine/sync had
+// `static` removed (main.c, zero behavior change) specifically for
+// this. The algorithm itself is not touched anywhere. ertm/erpm are
+// already non-static (src/common.h) and need no change.
 extern int step, ival, sine;
+extern char sync;
 #endif
 
 #ifdef BENCH_TEST
-// AT32F425-only bench harness: bounded, logged staged-duty acceleration
-// validation of upstream ESCape32's own startup/ADC-ZC/break-before-
-// make path, NOT a new stage_eXX-style FSM -- shared src/* motor-
-// control code is untouched. Throttle is injected via upstream's own
-// ANALOG mechanism (see add_target(MOUSEF425_BENCH ...), CMakeLists.txt
-// -- skips initio()/IOTIM entirely, `throt` is fully ours to write).
-// The per-stage duty CEILING is injected by directly mutating the
-// already-runtime-mutable `cfg.duty_max`/`cfg.duty_spup` fields (the
-// same fields execcmd()'s USB config commands mutate on real products)
-// while `throt` itself is simply held at max (2000) throughout -- this
-// hits each stage's target duty EXACTLY, rather than needing to invert
-// upstream's throttle->duty scale() formula per stage. ADC-ZC
-// threshold/CH4 sampling/timing advance/break-before-make are
-// untouched. All fields below are read via debugger/OpenOCD after the
-// run, same as Stage E24-E26/the first BENCH_TEST run.
-#define BENCH_TIME_LIMIT_TICKS 600 // 600 * 10ms = 6.0s hard overall limit -- Phase 1 needed ~900ms just for throt ramp + sine handover before the first accept, plus 6 duty stages each needing their own hold time
-#define BENCH_NUM_STAGES 6
-
-// Phase 2 duty ramp (15/30/50/70/85/100%), per instruction. Stage
-// advance is gated on CONTINUOUS accept (bench_stage_consecutive_accepts,
-// reset on every non-accept commutation cycle -- see dma1_channel1_isr()),
-// not merely "some commutations elapsed since a single accept" (Phase 1's
-// looser BENCH_POST_ZC_COMMUTATION_LIMIT criterion, no longer used here).
-// DIAGNOSTIC (per instruction): 15% start produced slow, visibly
-// juddering rotation on the real motor (matches the confirm log's
-// accept/accept/reject/timeout oscillation -- ival overshoots the
-// motor's actual mechanical response, gets rejected, times out, and
-// re-kicks from a forced single step). Testing whether a stronger
-// initial kick (30%) lets rotation actually stay ahead of ival's own
-// growth instead of stalling between forced steps. Revert to 15 once
-// root-caused.
-static const uint8_t bench_stage_duty[BENCH_NUM_STAGES] = {30, 30, 50, 70, 85, 100};
-#define BENCH_PHASE2_HOLD_COMMUTATIONS 8 // Consecutive accepted commutations required before advancing to the next stage (6-12 per instruction)
-#define BENCH_PHASE2_FINAL_HOLD_TICKS 15 // 15 * 10ms = 150ms -- how long to hold at the final (100%) stage once closed-loop is confirmed there, before auto-stopping (100-200ms per instruction)
+// AT32F425-only bench harness: bounded, logged validation of upstream
+// ESCape32's own startup/ADC-ZC/break-before-make path, NOT a new
+// stage_eXX-style FSM -- shared src/* motor-control code is untouched.
+// Throttle is injected via upstream's own ANALOG mechanism (see
+// add_target(MOUSEF425_BENCH ...), CMakeLists.txt -- skips
+// initio()/IOTIM entirely, `throt` is fully ours to write).
+//
+// REDESIGNED (per instruction, correcting an earlier misframing of this
+// harness's own goal): "reaching duty_max=100%" is NOT a meaningful
+// target -- PWM duty and rotation speed are related but distinct
+// (duty sets applied voltage; actual RPM is what the motor achieves in
+// response, gated by how fast the closed loop can safely track
+// acceleration). This harness no longer force-steps cfg.duty_max/
+// duty_spup through fixed percentages at all. Instead, cfg.duty_max is
+// set to its real final ceiling (100) ONCE, and cfg.duty_spup/
+// duty_ramp/duty_rate -- upstream's OWN, unmodified erpm-gated
+// acceleration governor, specifically designed to open up duty only as
+// fast as measured rotation actually keeps up (avoiding desync/"step-
+// out") -- are left to do the actual pacing, exactly as they would on
+// a real product with a real throttle stick. throt is ramped up once
+// (crossing cfg.sine_range's boundary so sine-startup engages, then on
+// up toward max) and then upstream's own control loop is solely
+// responsible for how much of that gets applied. What's measured here
+// is the OUTCOME: achieved commutation interval (-> erpm), how far
+// `sync` gets (0-6, upstream's own "how locked is closed-loop" signal),
+// and whether/when synchronization is lost -- not any duty percentage.
+#define BENCH_TIME_LIMIT_TICKS 500 // 500 * 10ms = 5.0s hard overall limit
+#define BENCH_LOCK_SYNC_THRESHOLD 6 // upstream's own full-lock threshold (nextstep(): `if (sync < 6) return;`) -- once reached, a subsequent ZC timeout is treated as a genuine desync (stop), not startup noise
 
 #define BENCH_CONFIRM_LOG_N 16
 typedef struct {
@@ -301,7 +297,7 @@ typedef struct {
 volatile bench_confirm_log_t bench_confirm_log[BENCH_CONFIRM_LOG_N];
 volatile uint32_t bench_confirm_log_count; // Total confirms seen (keeps counting past BENCH_CONFIRM_LOG_N)
 
-enum { BENCH_STOP_NONE = 0, BENCH_STOP_ALL_STAGES_DONE, BENCH_STOP_TIME_LIMIT, BENCH_STOP_FAULT, BENCH_STOP_UNSAFE_RESET, BENCH_STOP_ZC_TIMEOUT };
+enum { BENCH_STOP_NONE = 0, BENCH_STOP_TIME_LIMIT_LOCKED, BENCH_STOP_TIME_LIMIT_UNLOCKED, BENCH_STOP_FAULT, BENCH_STOP_UNSAFE_RESET, BENCH_STOP_ZC_TIMEOUT };
 
 // Reset cause (AT32_RESET_CAUSE_* bitmask, artery_hal.h), read/cleared
 // in init() BEFORE at32_clock_init() (crm_reset() may clear the CRM
@@ -309,13 +305,19 @@ enum { BENCH_STOP_NONE = 0, BENCH_STOP_ALL_STAGES_DONE, BENCH_STOP_TIME_LIMIT, B
 // rest of this boot -- see bench_test_init().
 volatile unsigned bench_reset_cause;
 
+// Single continuous run -- no more per-duty-percentage stages (see this
+// file's top comment). Tracks the OUTCOME of letting upstream's own
+// throttle/erpm-gated acceleration run: how fast rotation actually got
+// (interval_100us_min = the achieved TOP speed) and how far upstream's
+// own lock indicator (`sync`) got, not any duty percentage.
 typedef struct {
-	uint32_t duty_percent;
-	uint32_t confirm_count;       // ADC-ZC schmitt-trigger confirms this stage (candidates only -- see zc_accepted_count for the accept-gated count)
-	uint32_t zc_accepted_count;   // Of those, how many iftim_isr() itself accepted (IFTIM_OCR actually changed, not an early `t<ival>>1` reject)
-	uint32_t commutation_count;   // TIM1 COM events committed this stage
-	uint32_t uif_count;           // IFTIM timeouts this stage (expected during this stage's own initial ramp, not necessarily a fault)
-	uint32_t fault_count;         // 0 or 1 -- see tim3_isr()'s fault trigger
+	uint32_t confirm_count;     // ADC-ZC schmitt-trigger confirms (candidates only -- see zc_accepted_count for the accept-gated count)
+	uint32_t zc_accepted_count; // Of those, how many iftim_isr() itself accepted (IFTIM_OCR actually changed, not an early `t<ival>>1` reject)
+	uint32_t commutation_count; // TIM1 COM events committed
+	uint32_t uif_count;         // IFTIM timeouts (expected during initial bootstrap, before lock is ever established -- see BENCH_LOCK_SYNC_THRESHOLD)
+	uint32_t fault_count;       // 0 or 1 -- see tim3_isr()'s fault trigger
+	uint32_t sync_max;          // Highest upstream `sync` value (0-6) ever observed -- 6 means full lock was genuinely reached at least once
+	uint32_t erpm_max;          // Highest upstream `erpm` value ever observed -- upstream's own electrical-RPM estimate, only meaningful once sync>=6 (ertm is a real measurement, not the 1e8 UIF-timeout placeholder, from that point on)
 	// ival ESTIMATE reconstructed from IFTIM_OCR via upstream's own
 	// formula inverted: OCR = max((ival-(ival*cfg.timing>>5))>>1, 1);
 	// with cfg.timing left at its default (16, not overridden by this
@@ -325,26 +327,25 @@ typedef struct {
 	// `ival` (that IS separately available now via the extern above,
 	// but this field predates that and is kept as a cross-check). The
 	// independently, directly MEASURED wall-clock gap between commits
-	// (interval_100us_*) is the authoritative figure.
+	// (interval_100us_*) is the authoritative figure -- interval_100us_min
+	// in particular IS the achieved top speed (shortest commutation
+	// period), the actual metric of interest for this harness now.
 	uint32_t ival_est_min_ticks, ival_est_max_ticks, ival_est_sum_ticks, ival_est_n;
 	// Directly measured (TIM14-derived wide timestamp) inter-commit gap, 100us units.
 	uint32_t interval_100us_min, interval_100us_max, interval_100us_sum, interval_100us_n;
-} bench_stage_log_t;
+} bench_run_log_t;
 
-volatile bench_stage_log_t bench_stage[BENCH_NUM_STAGES];
-volatile int bench_stage_index;      // 0..BENCH_NUM_STAGES-1 while running
-volatile int bench_stage_consecutive_accepts; // Consecutive ADC-ZC accepts in the CURRENT stage -- reset to 0 on any non-accept commutation; stage advances at BENCH_PHASE2_HOLD_COMMUTATIONS
-volatile int bench_final_hold_active;         // 1 once the LAST stage (100%) has proven closed-loop and is just holding briefly before auto-stop
-volatile uint32_t bench_final_hold_ticks;     // 10ms ticks elapsed since bench_final_hold_active was set (see tim14_isr())
+volatile bench_run_log_t bench_run;
+volatile int bench_lock_established; // 1 once sync has ever reached BENCH_LOCK_SYNC_THRESHOLD -- gates whether a subsequent ZC timeout counts as a real desync (stop) vs still-expected startup bootstrapping
 volatile int bench_stopped;
 volatile int bench_stop_reason; // BENCH_STOP_*
 volatile uint32_t bench_elapsed_ticks; // TIM14 overflow count, 10ms/tick -- moved off TIM7, which is now the F425-wide IFTIM-timeout generator (see this file's top comment)
 
 // Internal bookkeeping only (not part of the read-back log set).
-static uint32_t bench_last_commit_100us;             // Global (spans stage transitions -- a transition's own interval sample is real, just attributed to whichever stage is current at commit time)
+static uint32_t bench_last_commit_100us;             // Previous commit's bench_wide_timestamp(), for interval_100us_* computation
 static uint32_t bench_last_target_ticks;             // Most recent accepted IFTIM_OCR, for the ival_est_* reconstruction
 static uint32_t bench_last_confirm_100us;            // Any confirm, accepted or not -- confirm-to-confirm spacing
-static volatile uint8_t bench_last_reschedule_accepted; // 1 if the most recent iftim_reschedule() call was accept-driven (dma1_channel1_isr), 0 if timeout-driven (tim7_isr) -- read by tim3_isr()'s commit handler to track bench_stage_consecutive_accepts
+static volatile uint8_t bench_last_reschedule_accepted; // 1 if the most recent iftim_reschedule() call was accept-driven (dma1_channel1_isr), 0 if timeout-driven (tim7_isr)
 
 static uint32_t bench_wide_timestamp(void) {
 	// Two reads race against a TIM14 overflow landing in between (e.g.
@@ -367,28 +368,15 @@ static void bench_force_stop(int reason) {
 	throt = 0; // Also tell upstream's own control loop to want zero throttle from here on
 }
 
-static void bench_apply_stage(int idx) {
-	bench_stage_index = idx;
-	bench_stage_consecutive_accepts = 0;
-	bench_stage[idx].duty_percent = bench_stage_duty[idx];
-	cfg.duty_max = bench_stage_duty[idx];
-	cfg.duty_spup = bench_stage_duty[idx]; // DUTY_RAMP=0 (default, not overridden) makes duty_spup an independent, otherwise-fixed ceiling -- keep it in lockstep with duty_max so it never masks the stage's intended duty
-}
-
-// Phase 1 (upstream sine-startup validation): BENCH_TEST used to inject
-// a constant throt=2000 (max) and rely entirely on cfg.duty_max/
-// duty_spup to cap the actual output -- but upstream's own sine-startup
-// ramp (src/main.c) is gated on the THROTTLE INPUT itself being within
-// cfg.sine_range's window, not on the resulting duty, so throt=2000
-// (always far outside any reasonable sine_range) made sine-startup
-// unreachable regardless of cfg.sine_range's value. Ramping throt itself
-// here, gradually, starting from within the sine window, lets upstream's
-// own (unmodified) sine-startup/6-step-handover state machine run
-// exactly as intended -- no separate startup FSM of our own. duty_max/
-// duty_spup (bench_apply_stage()) still independently cap the actual
-// output at a safe ceiling regardless of how high throt itself ramps.
+// Throttle is ramped once, from within cfg.sine_range's window up to
+// max, so upstream's own sine-startup engages (gated on the THROTTLE
+// INPUT being within that window, not on the resulting duty) and then
+// hands over to 6-step -- no separate startup FSM of our own. From
+// there, upstream's OWN duty_spup/duty_ramp/duty_rate mechanism (see
+// this file's top comment) is solely responsible for how much of that
+// commanded throttle actually reaches the motor.
 #define BENCH_THROT_RAMP_STEP 10  // Per 10ms tick (this function's own cadence)
-#define BENCH_THROT_RAMP_MAX 2000 // Full throttle range -- Phase 2 needs throt to reach near-2000 so newduty alone can approach 100% at the final stage; cfg.duty_max/duty_spup (bench_apply_stage(), one per stage) are what actually cap real output at each stage's intended ceiling, not this
+#define BENCH_THROT_RAMP_MAX 2000 // Full throttle range -- upstream's own duty_spup/duty_ramp governor (not this) is what actually paces real output
 
 void tim14_isr(void) {
 	if (!(TIM14_SR & TIM_SR_UIF)) return;
@@ -406,9 +394,8 @@ void tim14_isr(void) {
 		TIM1_BDTR &= ~TIM_BDTR_MOE;
 		return;
 	}
-	if (++bench_elapsed_ticks >= BENCH_TIME_LIMIT_TICKS) bench_force_stop(BENCH_STOP_TIME_LIMIT);
+	if (++bench_elapsed_ticks >= BENCH_TIME_LIMIT_TICKS) bench_force_stop(bench_lock_established ? BENCH_STOP_TIME_LIMIT_LOCKED : BENCH_STOP_TIME_LIMIT_UNLOCKED);
 	if (throt < BENCH_THROT_RAMP_MAX) throt += BENCH_THROT_RAMP_STEP;
-	if (bench_final_hold_active && ++bench_final_hold_ticks >= BENCH_PHASE2_FINAL_HOLD_TICKS) bench_force_stop(BENCH_STOP_ALL_STAGES_DONE);
 }
 
 static void bench_test_init(void) {
@@ -444,19 +431,30 @@ static void bench_test_init(void) {
 		return; // throt stays 0 -- main()'s control loop never sets running=1
 	}
 
-	// Phase 1: enable upstream's own sine-startup ramp (off by default,
+	// Enable upstream's own sine-startup ramp (off by default,
 	// SINE_RANGE=0 -- see src/defs.h) and start throt WITHIN its window
 	// (range = cfg.sine_range*20 = 300, minus the ramp's own hysteresis
 	// delta) so main()'s control loop actually enters the sine branch
 	// instead of jumping straight to 6-step. tim14_isr() (above) ramps
 	// throt upward every 10ms until it naturally crosses the sine_range
 	// boundary, triggering upstream's own (unmodified) handover to
-	// 6-step -- no separate startup FSM. cfg.duty_max/duty_spup
-	// (bench_apply_stage()) independently cap the real output at a safe
-	// ceiling throughout, regardless of how far throt itself ramps.
+	// 6-step -- no separate startup FSM.
 	cfg.sine_range = 15;
 	throt = 50;
-	bench_apply_stage(0);
+
+	// Real final duty ceiling (100, set ONCE -- not stepped) plus
+	// upstream's own erpm-gated acceleration governor: duty_spup=30 is
+	// the floor applied while erpm==0 (matches the empirical finding
+	// that 15% gave this motor visibly juddering, stalling rotation --
+	// see this file's top comment -- while 30% did not); duty_ramp=10
+	// lets the ceiling open smoothly from that floor up to 100% as
+	// upstream's own measured erpm climbs from 0 toward 10000, instead
+	// of DUTY_RAMP=0's default instant-100%-the-moment-erpm-is-nonzero
+	// jump (scale()'s degenerate zero-width-range behavior). duty_rate
+	// (curduty slew-rate limit) is left at upstream's own default.
+	cfg.duty_max = 100;
+	cfg.duty_spup = 30;
+	cfg.duty_ramp = 10;
 }
 #endif
 
@@ -592,6 +590,21 @@ static void iftim_reschedule(uint16_t target) {
 	TIM3_DIER |= TIM_DIER_CC3IE;
 }
 
+// Backs IFTIM_OCR_WRITE() (config.h). On upstream's own single-IFTIM
+// backends, writing IFTIM_OCR is itself what arms the next commutation
+// (IFTIM's own compare event fires it); here the commutation event comes
+// from TIM3, so the value has to be pushed into TIM3's schedule on every
+// write. This is what makes upstream's sine-startup microstep pacing
+// work at all -- nextstep()'s sine branch writes IFTIM_OCR once per
+// microstep and expects the commutation to follow at exactly that
+// interval, which previously never reached TIM3 (the only callers of
+// iftim_reschedule() were the ADC-ZC accept path -- disarmed during sine
+// startup by upstream's own compctl(0) -- and TIM7's 32.767ms timeout).
+void at32_iftim_ocr_write(uint32_t v) {
+	TIM2_CCR3 = v;
+	iftim_reschedule((uint16_t)v);
+}
+
 void dma1_channel1_isr(void) {
 	if (!at32_bemf_dma_transfer_complete()) return; // Artery-facing flag check -- see artery_hal.h
 	if (zc_floating_idx < 0) return;
@@ -619,7 +632,12 @@ void dma1_channel1_isr(void) {
 			confirm_since_commit = bench_last_commit_100us ? confirm_now - bench_last_commit_100us : 0;
 			confirm_since_prev = bench_last_confirm_100us ? confirm_now - bench_last_confirm_100us : 0;
 			bench_last_confirm_100us = confirm_now;
-			bench_stage[bench_stage_index].confirm_count++; // Candidate only -- accept/reject determined below
+			bench_run.confirm_count++; // Candidate only -- accept/reject determined below
+			if ((uint32_t)sync > bench_run.sync_max) bench_run.sync_max = (uint32_t)sync;
+			if (sync >= BENCH_LOCK_SYNC_THRESHOLD) {
+				bench_lock_established = 1;
+				if ((uint32_t)erpm > bench_run.erpm_max) bench_run.erpm_max = (uint32_t)erpm;
+			}
 			diag_cval = TIM2_CNT;
 			diag_ival = (uint32_t)ival;
 			diag_step = (uint8_t)step;
@@ -640,7 +658,7 @@ void dma1_channel1_isr(void) {
 #ifdef BENCH_TEST
 		if (!bench_stopped) {
 			if (accepted) {
-				bench_stage[bench_stage_index].zc_accepted_count++;
+				bench_run.zc_accepted_count++;
 				bench_last_target_ticks = ccr3_after;
 				bench_last_reschedule_accepted = 1;
 			}
@@ -703,10 +721,10 @@ void tim3_isr(void) {
 				// it reads back low -- something external (a hardware
 				// BRK/fault input, or the driver itself) is holding the
 				// outputs off despite our request. Stop immediately.
-				bench_stage[bench_stage_index].fault_count = 1;
+				bench_run.fault_count = 1;
 				bench_force_stop(BENCH_STOP_FAULT);
 			} else {
-				volatile bench_stage_log_t *s = &bench_stage[bench_stage_index];
+				volatile bench_run_log_t *s = &bench_run;
 				uint32_t now = bench_wide_timestamp(); // 100us units, monotonic across the whole bounded run
 				if (bench_last_commit_100us) { // Skip the very first-ever commit -- no valid prior timestamp yet
 					uint32_t interval = now - bench_last_commit_100us;
@@ -724,26 +742,6 @@ void tim3_isr(void) {
 					s->ival_est_n++;
 				}
 				s->commutation_count++;
-				// Phase 2 stage advance: gated on CONTINUOUS accept, not
-				// merely "some commutations elapsed since a single
-				// accept" -- any non-accept-driven commit (timeout
-				// fallback) breaks the streak. Once the streak reaches
-				// BENCH_PHASE2_HOLD_COMMUTATIONS, advance to the next
-				// duty stage; at the last stage, hold briefly instead
-				// (BENCH_PHASE2_FINAL_HOLD_TICKS, tracked by tim14_isr())
-				// then auto-stop, per instruction (no long unattended run
-				// at 100%).
-				if (bench_last_reschedule_accepted) {
-					if (++bench_stage_consecutive_accepts >= BENCH_PHASE2_HOLD_COMMUTATIONS) {
-						if (bench_stage_index + 1 < BENCH_NUM_STAGES) bench_apply_stage(bench_stage_index + 1);
-						else if (!bench_final_hold_active) {
-							bench_final_hold_active = 1;
-							bench_final_hold_ticks = 0;
-						}
-					}
-				} else {
-					bench_stage_consecutive_accepts = 0;
-				}
 			}
 		}
 #endif
@@ -785,14 +783,14 @@ void tim7_isr(void) {
 	TIM7_SR = (uint16_t)~TIM_SR_UIF;
 #ifdef BENCH_TEST
 	bench_last_reschedule_accepted = 0;
-	// Phase 2 stop condition ("ZC timeout"): a genuine 32.767ms timeout
-	// this far into the ramp (past stage 0's own initial bootstrap,
-	// where timeouts are an expected/tolerated part of first lock-in)
-	// means real BEMF sync was lost -- stop immediately rather than
-	// silently falling back to open-loop bootstrap pacing.
+	// ZC timeout stop condition: a genuine 32.767ms timeout AFTER
+	// upstream's own full-lock signal (`sync`) has ever reached
+	// BENCH_LOCK_SYNC_THRESHOLD means real BEMF sync was genuinely lost
+	// -- stop immediately. Before that point (still bootstrapping),
+	// timeouts are an expected, tolerated part of first lock-in.
 	if (!bench_stopped) {
-		bench_stage[bench_stage_index].uif_count++;
-		if (bench_stage_index > 0) bench_force_stop(BENCH_STOP_ZC_TIMEOUT);
+		bench_run.uif_count++;
+		if (bench_lock_established) bench_force_stop(BENCH_STOP_ZC_TIMEOUT);
 	}
 #endif
 	iftim_timeout();

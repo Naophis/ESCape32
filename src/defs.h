@@ -122,6 +122,15 @@
 #ifndef IFTIM_RESET
 #define IFTIM_RESET() (TIM_EGR(IFTIM) = TIM_EGR_UG)
 #endif
+// Writing IFTIM's output-compare value IS what arms the next commutation
+// event on a single-IFTIM backend (the timer's own compare interrupt
+// fires it). A backend that generates the commutation event from a
+// SEPARATE timer (see mcu/AT32F425/config.c -- TIM3 there) has to be
+// told about the new target explicitly, so every such write goes through
+// this hook. Default: the plain register write, unchanged.
+#ifndef IFTIM_OCR_WRITE
+#define IFTIM_OCR_WRITE(v) (IFTIM_OCR = (v))
+#endif
 #ifndef IFTIM_TIMEOUT_ARM
 #define IFTIM_TIMEOUT_ARM() (TIM_DIER(IFTIM) = TIM_DIER_UIE | IFTIM_ICIE)
 #endif

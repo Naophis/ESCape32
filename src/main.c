@@ -92,7 +92,13 @@ int sine;
 // per-confirm accept/reject logging (see mcu/AT32F425/config.c) --
 // zero behavior change, nothing here reads or writes them differently.
 int step, ival;
-static char prep, sync, fast, lock, led, ready, reverse;
+// sync: NOT static (unlike the rest of this line) purely so an
+// AT32F425 BENCH_TEST diagnostic build can read it read-only -- it's
+// the direct signal of "N consecutive good commutations" (0-6) upstream
+// itself uses to gate the erpm-based duty_spup->100% release (see
+// nextstep()'s `if (sync < 6) return;`). Zero behavior change.
+char sync;
+static char prep, fast, lock, led, ready, reverse;
 static uint32_t tickv;
 static volatile char tickf;
 #ifndef HALL_MAP
@@ -127,7 +133,7 @@ static int getcode(void) {
 static void nextstep(void) {
 	if (sine) { // Sine startup
 		IFTIM_ARR_WRITE(sine);
-		IFTIM_OCR = sine;
+		IFTIM_OCR_WRITE(sine);
 		IFTIM_RESET();
 		if (!prep && step) step = step * 60 - 59; // Switch over from 6-step
 		if (reverse) {
@@ -418,7 +424,7 @@ void iftim_isr(void) { // BEMF zero-crossing
 	int u = ival * 3;
 	fast = (t < u >> 2 || t > u >> 1) && ertm < 2000; // Fast acceleration/deceleration
 	ival = (t + u) >> 2; // Commutation interval
-	IFTIM_OCR = max((ival - (ival * cfg.timing >> 5)) >> 1, 1); // Commutation delay
+	IFTIM_OCR_WRITE(max((ival - (ival * cfg.timing >> 5)) >> 1, 1)); // Commutation delay
 	IFTIM_RESET();
 	IFTIM_TIMEOUT_DISARM();
 	if (sync < 6) ++sync;
@@ -747,7 +753,7 @@ void main(void) {
 				int a = step - 1;
 				int b = a / 60;
 				int c = b * 60;
-				IFTIM_OCR = sine * (reverse ? (void)(++b == 6 && (b = 0)), a - c + 1 : c - a + 60); // Commutation delay
+				IFTIM_OCR_WRITE(sine * (reverse ? (void)(++b == 6 && (b = 0)), a - c + 1 : c - a + 60)); // Commutation delay
 				IFTIM_ARR_WRITE((1 << (IFTIM_XRES + 16)) - 1);
 				IFTIM_RESET();
 				step = b + 1;
@@ -840,7 +846,7 @@ void main(void) {
 			TIM1_DIER |= TIM_DIER_COMIE;
 #endif
 			IFTIM_ARR_WRITE((1 << (IFTIM_XRES + 16)) - 1);
-			IFTIM_OCR = (1 << (IFTIM_XRES + 16)) - 1;
+			IFTIM_OCR_WRITE((1 << (IFTIM_XRES + 16)) - 1);
 			IFTIM_RESET();
 			__enable_irq();
 			initpid(&bpid, 10000 << IFTIM_XRES);
