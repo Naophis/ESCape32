@@ -81,6 +81,28 @@
 #define LED_CNT 4
 #endif
 
+// Comparator-based backends use TIM1 CH4 as a hardware blanking window
+// around each commutation edge (see nextstep() in main.c). ADC-based ZC
+// backends (AT32F425) do their blanking in software (ADC-ZC state
+// machine: blank scans -> armed -> confirm) and need CH4 left entirely
+// alone for their own ADC-trigger use -- see mcu/AT32F425/config.h,
+// which overrides both macros to no-ops when ADC_ZC_BACKEND is defined.
+#ifndef COMP_BLANK_CH4_INIT
+#define COMP_BLANK_CH4_INIT(m2, er) do { (m2) |= TIM_CCMR2_OC4PE | TIM_CCMR2_OC4M_PWM1; (er) |= TIM_CCER_CC4E; } while (0)
+#endif
+#ifndef COMP_BLANK_CH4_SET
+#define COMP_BLANK_CH4_SET(x) (TIM1_CCR4 = (x))
+#endif
+
+// Portable break-before-make hook, called once per nextstep() call
+// immediately before the new sector's CCMR/CCER shadow registers are
+// written (which only become ACTIVE at the FOLLOWING COM event -- see
+// mcu/AT32F425/config.h/.c for why the real 2us gate-off/commit timing
+// lives in an independent scheduler rather than here). Default: no-op.
+#ifndef COMMUTATION_BREAK
+#define COMMUTATION_BREAK() ((void)0)
+#endif
+
 #ifndef TEMP_SENS
 #define TEMP_SENS NTC10K3455UP2K
 #endif

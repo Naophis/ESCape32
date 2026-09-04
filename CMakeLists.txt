@@ -101,12 +101,47 @@ add_target(TMOTOR2 STM32F051 DEAD_TIME=26 COMP_MAP=321 SMALL_DEVICE)
 add_target(TMOTOR3 STM32G071 DEAD_TIME=35 COMP_MAP=231 IO_PA6)
 add_target(TMOTOR4 STM32G071 DEAD_TIME=35 COMP_MAP=123)
 
+# MOUSEF425: custom board, AT32F425K8U7-4 + MP6540HGU-A-Z. DEAD_TIME=53
+# and COMP_MAP=123 are the only two values carried over from Stage
+# A-E26 hardware bring-up (53 ticks -- Stage E15D onward; COMP_MAP is
+# an identity-mapping PLACEHOLDER, not yet independently verified
+# against this board's actual phase wiring, unlike DEAD_TIME/the TIM1
+# AF pinout/BEMF ADC channels -- see mcu/AT32F425/config.c's
+# comp_in_to_adc_idx[] table if it needs correcting later). No throttle
+# input has been hardware-validated (see config.h) -- the first
+# low-duty spin test needs a real servo/Oneshot PWM signal wired to
+# PA2, ARM/THROT_SET are intentionally left at their safe upstream
+# defaults (250ms zero-throttle arm wait, no preset throttle).
+add_target(MOUSEF425 AT32F425 DEAD_TIME=53 COMP_MAP=123)
+# artery_hal.c pulls in the vendored Artery driver (see its own header
+# comment) -- that vendor code needs the same device-select define and
+# CMSIS core header path the standalone bring-up harnesses pass via
+# at32f425_defs/cmsis_core (mcu/AT32F425/config.cmake), which
+# add_target()'s own generic ${defs}/include-dirs don't cover. Applied
+# directly to the already-defined target rather than touching
+# add_target() itself (shared upstream build infrastructure).
+target_compile_definitions(MOUSEF425-rev17.1.elf PRIVATE AT32F425K8U7_4)
+target_include_directories(MOUSEF425-rev17.1.elf PRIVATE mcu/AT32F425/cmsis_core)
+
+# Bounded, logged first-spin bench validation of the real MOUSEF425
+# backend (upstream startup/ADC-ZC/break-before-make path) -- NOT a
+# stage_eXX-style standalone harness: compiles the same shared src/*
+# control core + mcu/AT32F425/config.c unmodified. ANALOG+THROT_SET is
+# upstream's own supported mechanism for a fixed preset throttle with
+# no signal wiring (skips initio()/IOTIM entirely -- see config.c's
+# BENCH_TEST comment); DUTY_MAX/DUTY_SPUP cap actual output at 15%
+# regardless. BENCH_TEST adds only logging/a bounded forced stop,
+# entirely inside mcu/AT32F425/config.c behind #ifdef BENCH_TEST.
+add_target(MOUSEF425_BENCH AT32F425 DEAD_TIME=53 COMP_MAP=123 ANALOG THROT_SET=30 DUTY_MAX=15 DUTY_SPUP=15 BENCH_TEST)
+target_compile_definitions(MOUSEF425_BENCH-rev17.1.elf PRIVATE AT32F425K8U7_4)
+target_include_directories(MOUSEF425_BENCH-rev17.1.elf PRIVATE mcu/AT32F425/cmsis_core)
+
 # --- AT32F425 (MOUSEF425) staged bring-up harnesses ------------------------
 # Temporary, standalone targets: do NOT use add_target() / mcu/common.ld,
 # and do NOT compile src/*.c (the shared ESCape32 control loop touches
 # TIM1/MP6540HA and calls compctl(), which has no real implementation
 # until the Stage D BEMF design lands -- see the porting-plan Section 18
-# report and mcu/AT32F425/stage_*_main.c). Each stage_*_main.c is its own
+# report and mcu/AT32F425/bringup/stage_*_main.c). Each stage_*_main.c is its own
 # standalone main(); this function wires one up as its own firmware image.
 # No other target above this line is affected by this addition.
 include(mcu/AT32F425/config.cmake)
@@ -120,7 +155,7 @@ function(add_at32f425_bringup name mainfile)
 	add_executable(${elf}
 		${mainfile}
 		${ARGN}
-		mcu/AT32F425/clock_config.c
+		mcu/AT32F425/bringup/clock_config.c
 		mcu/AT32F425/vendor/system_at32f425.c
 		mcu/AT32F425/vendor/at32f425_crm.c
 		mcu/AT32F425/vendor/at32f425_gpio.c
@@ -139,7 +174,7 @@ function(add_at32f425_bringup name mainfile)
 	target_compile_options(${elf} PRIVATE ${at32f425_opts})
 	target_compile_definitions(${elf} PRIVATE ${at32f425_defs})
 	target_link_options(${elf} PRIVATE
-		-T${CMAKE_CURRENT_SOURCE_DIR}/mcu/AT32F425/config.ld
+		-T${CMAKE_CURRENT_SOURCE_DIR}/mcu/AT32F425/bringup.ld
 		-nostartfiles -Wl,--gc-sections
 		${at32f425_opts}
 	)
@@ -154,43 +189,43 @@ function(add_at32f425_bringup name mainfile)
 	add_custom_target(flash-${name} COMMAND st-flash --reset --connect-under-reset --format ihex write ${hex} DEPENDS ${hex})
 endfunction()
 
-add_at32f425_bringup(MOUSEF425_STAGE_A mcu/AT32F425/stage_a_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_B mcu/AT32F425/stage_b_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_C mcu/AT32F425/stage_c_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_D mcu/AT32F425/stage_d_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_D_ACTIVE mcu/AT32F425/stage_d_active_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E mcu/AT32F425/stage_e_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E2 mcu/AT32F425/stage_e2_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E3 mcu/AT32F425/stage_e3_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E4 mcu/AT32F425/stage_e4_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E5 mcu/AT32F425/stage_e5_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E6 mcu/AT32F425/stage_e6_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E7 mcu/AT32F425/stage_e7_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E8 mcu/AT32F425/stage_e8_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E9 mcu/AT32F425/stage_e9_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E10 mcu/AT32F425/stage_e10_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E11 mcu/AT32F425/stage_e11_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E12 mcu/AT32F425/stage_e12_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E13 mcu/AT32F425/stage_e13_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E14 mcu/AT32F425/stage_e14_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E15 mcu/AT32F425/stage_e15_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E15B mcu/AT32F425/stage_e15b_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E15C mcu/AT32F425/stage_e15c_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E15D mcu/AT32F425/stage_e15d_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E16 mcu/AT32F425/stage_e16_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E16B mcu/AT32F425/stage_e16b_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E16C mcu/AT32F425/stage_e16c_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E16D mcu/AT32F425/stage_e16d_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E16E mcu/AT32F425/stage_e16e_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E16F mcu/AT32F425/stage_e16f_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E17 mcu/AT32F425/stage_e17_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E18 mcu/AT32F425/stage_e18_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E19 mcu/AT32F425/stage_e19_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E20 mcu/AT32F425/stage_e20_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E20B mcu/AT32F425/stage_e20b_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E21 mcu/AT32F425/stage_e21_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E22 mcu/AT32F425/stage_e22_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E23 mcu/AT32F425/stage_e23_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E24 mcu/AT32F425/stage_e24_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E25 mcu/AT32F425/stage_e25_main.c)
-add_at32f425_bringup(MOUSEF425_STAGE_E26 mcu/AT32F425/stage_e26_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_A mcu/AT32F425/bringup/stage_a_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_B mcu/AT32F425/bringup/stage_b_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_C mcu/AT32F425/bringup/stage_c_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_D mcu/AT32F425/bringup/stage_d_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_D_ACTIVE mcu/AT32F425/bringup/stage_d_active_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E mcu/AT32F425/bringup/stage_e_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E2 mcu/AT32F425/bringup/stage_e2_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E3 mcu/AT32F425/bringup/stage_e3_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E4 mcu/AT32F425/bringup/stage_e4_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E5 mcu/AT32F425/bringup/stage_e5_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E6 mcu/AT32F425/bringup/stage_e6_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E7 mcu/AT32F425/bringup/stage_e7_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E8 mcu/AT32F425/bringup/stage_e8_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E9 mcu/AT32F425/bringup/stage_e9_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E10 mcu/AT32F425/bringup/stage_e10_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E11 mcu/AT32F425/bringup/stage_e11_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E12 mcu/AT32F425/bringup/stage_e12_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E13 mcu/AT32F425/bringup/stage_e13_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E14 mcu/AT32F425/bringup/stage_e14_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E15 mcu/AT32F425/bringup/stage_e15_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E15B mcu/AT32F425/bringup/stage_e15b_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E15C mcu/AT32F425/bringup/stage_e15c_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E15D mcu/AT32F425/bringup/stage_e15d_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E16 mcu/AT32F425/bringup/stage_e16_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E16B mcu/AT32F425/bringup/stage_e16b_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E16C mcu/AT32F425/bringup/stage_e16c_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E16D mcu/AT32F425/bringup/stage_e16d_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E16E mcu/AT32F425/bringup/stage_e16e_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E16F mcu/AT32F425/bringup/stage_e16f_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E17 mcu/AT32F425/bringup/stage_e17_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E18 mcu/AT32F425/bringup/stage_e18_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E19 mcu/AT32F425/bringup/stage_e19_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E20 mcu/AT32F425/bringup/stage_e20_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E20B mcu/AT32F425/bringup/stage_e20b_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E21 mcu/AT32F425/bringup/stage_e21_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E22 mcu/AT32F425/bringup/stage_e22_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E23 mcu/AT32F425/bringup/stage_e23_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E24 mcu/AT32F425/bringup/stage_e24_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E25 mcu/AT32F425/bringup/stage_e25_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E26 mcu/AT32F425/bringup/stage_e26_main.c)

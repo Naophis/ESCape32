@@ -182,8 +182,9 @@ static void nextstep(void) {
 	int m2 = TIM_CCMR2_OC3PE;
 	int er = TIM_CCER_CC5E;
 #else
-	int m2 = TIM_CCMR2_OC3PE | TIM_CCMR2_OC4PE | TIM_CCMR2_OC4M_PWM1;
-	int er = TIM_CCER_CC4E;
+	int m2 = TIM_CCMR2_OC3PE;
+	int er = 0;
+	COMP_BLANK_CH4_INIT(m2, er); // No-op on ADC-ZC backends -- CH4 stays theirs
 #endif
 	if (cfg.throt_ztc && !throt) p = n = 0; // Zero-throttle coasting
 	if (p & 1) {
@@ -258,6 +259,7 @@ static void nextstep(void) {
 #ifdef INVERTED_HIGH
 	er |= TIM_CCER_CC1P | TIM_CCER_CC2P | TIM_CCER_CC3P;
 #endif
+	COMMUTATION_BREAK();
 	TIM1_CCMR1 = m1;
 	TIM1_CCMR2 = m2;
 	TIM1_CCER = er;
@@ -280,7 +282,7 @@ static void nextstep(void) {
 #ifdef TIM1_CCR5
 		TIM1_CCR5 = 0;
 #else
-		TIM1_CCR4 = 0;
+		COMP_BLANK_CH4_SET(0);
 #endif
 		IFTIM_ICMR = IFTIM_ICM3;
 		TIM_CR1(IFTIM) = TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS;
@@ -288,7 +290,7 @@ static void nextstep(void) {
 #ifdef TIM1_CCR5
 		TIM1_CCR5 = 0;
 #else
-		TIM1_CCR4 = 0;
+		COMP_BLANK_CH4_SET(0);
 #endif
 		IFTIM_ICMR = IFTIM_ICM2;
 		TIM_CR1(IFTIM) = TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS;
@@ -296,7 +298,7 @@ static void nextstep(void) {
 #ifdef TIM1_CCR5
 		TIM1_CCR5 = 0;
 #else
-		TIM1_CCR4 = 0;
+		COMP_BLANK_CH4_SET(0);
 #endif
 		IFTIM_ICMR = IFTIM_ICM1;
 		TIM_CR1(IFTIM) = TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS;
@@ -304,7 +306,7 @@ static void nextstep(void) {
 #ifdef TIM1_CCR5
 		TIM1_CCR5 = 0;
 #else
-		TIM1_CCR4 = 0;
+		COMP_BLANK_CH4_SET(0);
 #endif
 		IFTIM_ICMR = IFTIM_ICM1;
 		TIM_CR1(IFTIM) = TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS | TIM_CR1_CKD_CK_INT_MUL_2;
@@ -312,7 +314,7 @@ static void nextstep(void) {
 #ifdef TIM1_CCR5
 		TIM1_CCR5 = IFTIM_ICFL << 2;
 #else
-		TIM1_CCR4 = IFTIM_ICFL << 2;
+		COMP_BLANK_CH4_SET(IFTIM_ICFL << 2);
 #endif
 		IFTIM_ICMR = IFTIM_ICM1;
 		TIM_CR1(IFTIM) = TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS | TIM_CR1_CKD_CK_INT_MUL_4;
