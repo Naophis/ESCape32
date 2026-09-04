@@ -18,6 +18,23 @@
 // CRM/clock. Wraps the already hardware-validated clock_config_96mhz().
 void at32_clock_init(void);
 
+// Reset-cause flags (CRM CTRLSTS register), read via Artery's own
+// crm_flag_get()/CRM_*_RESET_FLAG -- must be called BEFORE
+// at32_clock_init() (which calls crm_reset(), and clock_config_96mhz()
+// starts with crm_reset() too) in case that clears them. Returns a
+// bitmask of AT32_RESET_CAUSE_* bits (multiple can be set on some
+// resets; report all of them rather than picking one).
+enum {
+	AT32_RESET_CAUSE_POR       = 1 << 0, // Power-on
+	AT32_RESET_CAUSE_NRST_PIN  = 1 << 1, // External reset pin
+	AT32_RESET_CAUSE_SW        = 1 << 2, // Software reset
+	AT32_RESET_CAUSE_WDT       = 1 << 3, // Independent watchdog
+	AT32_RESET_CAUSE_WWDT      = 1 << 4, // Window watchdog
+	AT32_RESET_CAUSE_LOWPOWER  = 1 << 5, // Low-power/brownout-adjacent (closest flag this silicon exposes)
+};
+unsigned at32_reset_cause_get(void);
+void at32_reset_cause_clear(void); // Call AFTER reading it once at boot -- otherwise flags accumulate across resets
+
 // ADC1 ordinary group (3-phase BEMF, PA0/PA4/PA5) + DMA1 channel1,
 // externally triggered by TIM1 CH4 (PWM_MODE_B, configured by config.c
 // -- CH4 itself is a libopencm3-compatible TIM1 register and is NOT

@@ -10,11 +10,11 @@
 **   EGR/SWTRIG bit positions match exactly (STM32 COMG=bit5 ==
 **   Artery hallswtr=bit5), so TIM1_EGR=TIM_EGR_COMG and Artery's
 **   tmr_event_sw_trigger(TMR1, TMR_HALL_SWTRIG) hit the SAME bit.
-** This is why TIM1/GPIO/IFTIM(=TIM3) below are driven with plain
-** libopencm3 macros exactly like mcu/AT32F421/config.h, while
-** CRM/ADC/DMA/clock (genuinely incompatible -- confirmed throughout
-** this port's Stage A-E26 bring-up) are handled exclusively by
-** artery_hal.c/h using the vendored Artery driver.
+** This is why TIM1/GPIO/IFTIM below are driven with plain libopencm3
+** macros exactly like mcu/AT32F421/config.h, while CRM/ADC/DMA/clock
+** (genuinely incompatible -- confirmed throughout this port's Stage
+** A-E26 bring-up) are handled exclusively by artery_hal.c/h using the
+** vendored Artery driver.
 **
 ** Found incompatibility: STM32's CCUS bit (TIM_CR2, used by upstream's
 ** main() to enable hardware TRGI-triggered CCPC shadow commits) is,
@@ -26,20 +26,48 @@
 ** E25/E26 validated tmr_hall_select(TMR1,TRUE) + TMR_HALL_SWTRIG on
 ** real hardware) -- no shared-code change was needed for this.
 **
-** Commutation timing: unlike STM32/AT32F421 (hardware TRGO from IFTIM's
-** OC3REF drives TIM1's COM event automatically via SMCR/ITRx), this
-** silicon's equivalent auto path (Stage E25, TMR3 TRGO -> TMR1 COM via
-** internal trigger IS2) was validated to work but explicitly NOT
-** adopted for production, because it cannot express the required
-** "gate-off 2us before commutation, commit exactly at commutation"
-** split. Instead, our own tim3_isr() (artery_hal.c) wraps upstream's
-** unmodified iftim_isr(), reading back the IFTIM_OCR (=TIM3_CCR3)
-** value iftim_isr() just computed and independently re-arming TIM3's
-** CC2 (gate-off, OCR-2us) and CC3 (commit) compare interrupts every
-** cycle -- since upstream unconditionally zeroes/rewrites TIM_DIER
-** (IFTIM) on every call, our own enable bits must be re-asserted after
-** every iftim_isr() invocation, which is exactly what this wrapper
-** does. See artery_hal.c's top comment for the full scheduler design.
+** TIMER ROLE ASSIGNMENT (revised -- see config.c's top comment for the
+** full history of why):
+**   TIM1  : 6PWM + CH4 ADC hardware trigger
+**   TIM2  : IFTIM -- upstream's BEMF timing core (iftim_isr()/ival/
+**           timing advance), 32-bit "Plus Mode" (PMEN), 0.5us/tick.
+**           TIM2_CNT is read LIVE (not via a capture register) as
+**           IFTIM_ICR -- see config.c's ADC-ZC confirm handler.
+**   TIM3  : 2us break-before-make scheduler ONLY. No longer IFTIM.
+**   TIM7  : BENCH_TEST elapsed-time watchdog
+**   TIM15 : IOTIM/DSHOT
+**
+** IFTIM was originally TIM3 (16-bit). Stage E27 found upstream's own
+** commutation-timing math relies on IFTIM's counter being reset (UG)
+** exactly at each accepted ZC and staying valid across arbitrarily
+** long intervals; on a 16-bit counter with upstream's own ARR=65535
+** ceiling, that assumption silently breaks before the first accept
+** (the counter free-runs on its own 32.767ms auto-reload instead of
+** being ZC-synchronized) -- Stage E27's software-overflow-extension
+** attempt to patch around this was abandoned (own boundary races) in
+** favor of moving IFTIM to a genuinely 32-bit-capable timer instead.
+** Stage E28 first found TIM2 behaving as 16-bit too -- turned out to
+** be a missing tmr_32_bit_function_enable(TMR2, TRUE) (PMEN) call, not
+** a hardware limitation (AT32F425's datasheet: TIM2 is 32-bit-capable,
+** 16-bit unless Plus Mode is explicitly enabled). Stage E28B confirmed
+** PMEN+PR=0xFFFFFFFF works (CVAL correctly free-runs/does not wrap
+** across 35/40/70ms); Stage E28D independently re-confirmed, against
+** the Cortex-M4's own DWT_CYCCNT wall clock with all other timers/
+** interrupts/motor hardware untouched, that CVAL tracks perfectly
+** linearly out to 100ms with zero drift at every checkpoint -- Stage
+** E28B/C's earlier ~40ms anomaly was therefore that test harness's own
+** artifact (TMR7 delay reference / CH1-CH3 setup interaction), not a
+** TIM2 hardware limitation.
+**
+** upstream's own nextstep() does `TIM_CR1(IFTIM) = TIM_CR1_CEN |
+** TIM_CR1_ARPE | TIM_CR1_URS [| ...];` -- a PLAIN, WHOLE-REGISTER
+** assignment, every commutation. Since PMEN lives in that same CTRL1/
+** CR1 register (bit10) and libopencm3's TIM_CR1_* macros don't know
+** about it, this write silently clears PMEN on every single
+** commutation. config.c re-asserts PMEN defensively at every point it
+** (or upstream, via a call config.c makes) is about to rely on TIM2's
+** 32-bit behavior, bounding how long it can stay cleared -- see
+** config.c's PMEN_REASSERT use sites.
 */
 
 #pragma once
@@ -47,25 +75,35 @@
 #define CLK 96000000
 
 #define IFTIM_XRES 0
-// IFTIM (TIM3) ticks at CLK/((CLK_MHZ>>(IFTIM_XRES+1))*1e6) = 2^(IFTIM_XRES+1) MHz
-// (see main.c's TIM_PSC(IFTIM) derivation) -- 2MHz/500ns per tick at
-// IFTIM_XRES=0. GATE_OFF_ADVANCE_TICKS is therefore 2us worth of ticks.
+// IFTIM (TIM2) ticks at 2^(IFTIM_XRES+1) MHz -- 2MHz/500ns per tick at
+// IFTIM_XRES=0 (see main.c's TIM_PSC(IFTIM) derivation, and config.c's
+// TIM2 base_init using the same 47 prescaler value). TIM3 (the 2us
+// scheduler) is configured at the identical tick rate so its CCR2/
+// CCR3 targets can be copied directly from IFTIM_OCR with no unit
+// conversion. GATE_OFF_ADVANCE_TICKS is 2us worth of ticks at that rate.
 #define GATE_OFF_ADVANCE_TICKS (2 << (IFTIM_XRES + 1))
 
-#define IFTIM TIM3
+#define IFTIM TIM2
 #define IFTIM_ICFL 128
-#define IFTIM_ICMR TIM3_CCMR1
+#define IFTIM_ICMR TIM2_CCMR1
 #define IFTIM_ICM1 (TIM_CCMR1_CC1S_IN_TI1 | TIM_CCMR1_IC1F_DTF_DIV_16_N_8)
 #define IFTIM_ICM2 (TIM_CCMR1_CC1S_IN_TI1 | TIM_CCMR1_IC1F_DTF_DIV_8_N_8)
 #define IFTIM_ICM3 (TIM_CCMR1_CC1S_IN_TI1 | TIM_CCMR1_IC1F_DTF_DIV_4_N_8)
 #define IFTIM_ICIE TIM_DIER_CC1IE
-#define IFTIM_ICR TIM3_CCR1
-#define IFTIM_OCR TIM3_CCR3
-// NOTE: iftim_isr is intentionally NOT #define'd to tim3_isr here (unlike
-// AT32F421). It keeps its real name and is called explicitly, once, from
-// our own tim3_isr() in artery_hal.c, which also does the F425-specific
-// gate-off/commit scheduling that upstream's hardware-TRGO design doesn't
-// need. See artery_hal.c.
+// IFTIM_ICR is a LIVE counter read, not a capture register: TIM2 CH1 is
+// never configured as an input-capture channel at all (no CH1 software
+// capture is used -- per instruction, not required as a mechanism).
+// Every real ADC-ZC confirm calls iftim_isr() directly from
+// dma1_channel1_isr() the instant it's confirmed, so `t = IFTIM_ICR`
+// (src/main.c) reading TIM2_CNT AT THAT EXACT MOMENT correctly means
+// "ticks since IFTIM was last reset" -- exactly upstream's own
+// intended semantics, achieved with no capture hardware involved.
+#define IFTIM_ICR TIM2_CNT
+#define IFTIM_OCR TIM2_CCR3
+// NOTE: iftim_isr is intentionally NOT #define'd to any ISR name. It
+// keeps its real name and is called explicitly from TWO places in
+// config.c: dma1_channel1_isr() (every real ADC-ZC confirm) and
+// tim2_isr() (IFTIM's own UIF timeout). See config.c's top comment.
 
 #define tim1_com_isr tim1_brk_up_trg_com_isr
 
@@ -102,8 +140,9 @@
 // no valid edges are ever seen on IOTIM's input, src/io.c's entryirq()
 // falls back, after ~1s, to a CLI-over-serial state -- WITH IO_PA2 that
 // fallback only touches USART2 (io_serial()); WITHOUT it, it directly
-// reconfigures TIM3, which is our IFTIM and would silently break BEMF/
-// commutation scheduling after about a second with no signal wired.
+// reconfigures TIM3 (hardcoded in src/io.c, not via the IFTIM macro) --
+// which is now our 2us break-before-make scheduler, so this protection
+// still matters even though TIM3 is no longer IFTIM.
 #define IO_PA2
 #define IOTIM TIM15
 #define IOTIM_IDR (GPIOA_IDR & 0x4) // A2

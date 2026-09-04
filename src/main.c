@@ -81,7 +81,12 @@ int throt, brake, ertm, erpm, temp1, temp2, volt, curr, csum, dshotval, beepval 
 char analog, telreq, telmode, telphid, flipdir, beacon, dshotext, rearm, auxup;
 uint32_t tick;
 
-static int oldstep, step, sine, ival, cutback;
+static int oldstep, sine, cutback;
+// step/ival: NOT static (unlike the rest of this line) purely so an
+// AT32F425 BENCH_TEST diagnostic build can `extern` them read-only for
+// per-confirm accept/reject logging (see mcu/AT32F425/config.c) --
+// zero behavior change, nothing here reads or writes them differently.
+int step, ival;
 static char prep, sync, fast, lock, led, ready, reverse;
 static uint32_t tickv;
 static volatile char tickf;

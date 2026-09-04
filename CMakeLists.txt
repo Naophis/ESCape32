@@ -132,7 +132,11 @@ target_include_directories(MOUSEF425-rev17.1.elf PRIVATE mcu/AT32F425/cmsis_core
 # BENCH_TEST comment); DUTY_MAX/DUTY_SPUP cap actual output at 15%
 # regardless. BENCH_TEST adds only logging/a bounded forced stop,
 # entirely inside mcu/AT32F425/config.c behind #ifdef BENCH_TEST.
-add_target(MOUSEF425_BENCH AT32F425 DEAD_TIME=53 COMP_MAP=123 ANALOG THROT_SET=30 DUTY_MAX=15 DUTY_SPUP=15 BENCH_TEST)
+# DUTY_MAX/DUTY_SPUP compile-time defaults just need to safely cover
+# the highest bench stage (40%) before bench_apply_stage() takes over
+# at runtime (see mcu/AT32F425/config.c) -- the actual per-stage duty
+# ceiling injection happens there, not via these compile constants.
+add_target(MOUSEF425_BENCH AT32F425 DEAD_TIME=53 COMP_MAP=123 ANALOG DUTY_MAX=40 DUTY_SPUP=40 BENCH_TEST)
 target_compile_definitions(MOUSEF425_BENCH-rev17.1.elf PRIVATE AT32F425K8U7_4)
 target_include_directories(MOUSEF425_BENCH-rev17.1.elf PRIVATE mcu/AT32F425/cmsis_core)
 
@@ -229,3 +233,8 @@ add_at32f425_bringup(MOUSEF425_STAGE_E23 mcu/AT32F425/bringup/stage_e23_main.c)
 add_at32f425_bringup(MOUSEF425_STAGE_E24 mcu/AT32F425/bringup/stage_e24_main.c)
 add_at32f425_bringup(MOUSEF425_STAGE_E25 mcu/AT32F425/bringup/stage_e25_main.c)
 add_at32f425_bringup(MOUSEF425_STAGE_E26 mcu/AT32F425/bringup/stage_e26_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E27 mcu/AT32F425/bringup/stage_e27_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E28 mcu/AT32F425/bringup/stage_e28_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E28B mcu/AT32F425/bringup/stage_e28b_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E28C mcu/AT32F425/bringup/stage_e28c_main.c)
+add_at32f425_bringup(MOUSEF425_STAGE_E28D mcu/AT32F425/bringup/stage_e28d_main.c)

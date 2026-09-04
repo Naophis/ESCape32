@@ -39,6 +39,23 @@ void at32_clock_init(void)
   clock_config_96mhz();
 }
 
+unsigned at32_reset_cause_get(void)
+{
+  unsigned c = 0;
+  if (crm_flag_get(CRM_POR_RESET_FLAG) != RESET) c |= AT32_RESET_CAUSE_POR;
+  if (crm_flag_get(CRM_NRST_RESET_FLAG) != RESET) c |= AT32_RESET_CAUSE_NRST_PIN;
+  if (crm_flag_get(CRM_SW_RESET_FLAG) != RESET) c |= AT32_RESET_CAUSE_SW;
+  if (crm_flag_get(CRM_WDT_RESET_FLAG) != RESET) c |= AT32_RESET_CAUSE_WDT;
+  if (crm_flag_get(CRM_WWDT_RESET_FLAG) != RESET) c |= AT32_RESET_CAUSE_WWDT;
+  if (crm_flag_get(CRM_LOWPOWER_RESET_FLAG) != RESET) c |= AT32_RESET_CAUSE_LOWPOWER;
+  return c;
+}
+
+void at32_reset_cause_clear(void)
+{
+  CRM->ctrlsts_bit.rstfc = TRUE;
+}
+
 void at32_dma_flexible_routing_init(void)
 {
   crm_periph_clock_enable(CRM_DMA1_PERIPH_CLOCK, TRUE);

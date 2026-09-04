@@ -7,7 +7,64 @@
 ** values, since Stage E15D independently re-derived the identical
 ** MUX_2 encoding for TIM1's six PWM pins on this silicon). CRM/ADC/DMA
 ** are handled by artery_hal.c/h; see config.h's top comment for the
-** compatibility rationale and the tim3_isr scheduler design.
+** compatibility rationale.
+**
+** TIMER ROLES (see config.h's top comment for the full history of the
+** TIM3->TIM2 IFTIM migration -- Stage E27/E28/E28B/E28C/E28D):
+**   TIM1  : 6PWM + CH4 ADC hardware trigger
+**   TIM2  : IFTIM -- upstream's BEMF timing core, 32-bit Plus Mode
+**   TIM3  : 2us break-before-make scheduler ONLY (no longer IFTIM)
+**   TIM7  : BENCH_TEST elapsed-time watchdog
+**   TIM15 : IOTIM/DSHOT
+**
+** How a real ADC-ZC confirm flows through the two timers:
+**   1. dma1_channel1_isr() confirms a zero-cross (Stage E14's
+**      Schmitt-trigger dual-arm design) and calls iftim_isr()
+**      (src/main.c, unmodified) DIRECTLY -- no capture register is
+**      used at all (CH1 software capture is deliberately NOT used,
+**      per instruction; TIM2 CH1 is never configured as an input-
+**      capture channel). Since IFTIM_ICR is #define'd (config.h) to
+**      TIM2_CNT -- a LIVE counter read, not a captured register --
+**      upstream's `t = IFTIM_ICR` reads "ticks since IFTIM was last
+**      reset" at the exact instant we call it, which is exactly the
+**      semantic upstream's algorithm assumes.
+**   2. If iftim_isr() accepts (detected by us: IFTIM_OCR, aka
+**      TIM2_CCR3, changed value), upstream's own code inside
+**      iftim_isr()'s accept branch has ALREADY issued
+**      `TIM_EGR(IFTIM) = TIM_EGR_UG` (unmodified -- this now resets
+**      TIM2, not TIM3) -- exactly upstream's own reset-on-accept
+**      semantics, achieved with zero extra code from us. We then
+**      resynchronize TIM3 (the scheduler) to the same zero point
+**      (iftim_reschedule()) and reprogram its CC2 (gate-off)/CC3
+**      (commit) targets directly from the new IFTIM_OCR value -- both
+**      timers tick at the identical 500ns rate, so no unit conversion
+**      is needed, just a copy.
+**   3. tim2_isr() (TIM2's own UIF/timeout interrupt) mirrors this for
+**      the "no ZC arrived in time" case: calls iftim_isr() (which
+**      takes its UIF branch, resets sync but does NOT change
+**      IFTIM_OCR), then UNCONDITIONALLY reschedules TIM3 from
+**      whatever IFTIM_OCR currently holds. This reproduces the
+**      "commutate every ~32.7ms" bootstrap behavior the OLD (TIM3-as-
+**      IFTIM) design got for free from ARR==OCR hardware coincidence
+**      (both were the same physical timer, so a stale CC3 compare
+**      flag would already be set by the time the combined ISR read
+**      its SR snapshot); with IFTIM and the scheduler now on two
+**      separate timers, that coincidence doesn't exist anymore, so
+**      this step reproduces it explicitly in software instead.
+**   4. tim3_isr() itself now only does the 2us-before/commit
+**      scheduling (CC2 -> MOE off, CC3 -> EGR_COMG + MOE on) -- no
+**      IFTIM/UIF logic at all anymore.
+**
+** PMEN (TIM2 Plus Mode / 32-bit): upstream's nextstep() does
+** `TIM_CR1(IFTIM) = TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS [| ...];`
+** every commutation -- a PLAIN, WHOLE-REGISTER assignment. PMEN lives
+** in that same CTRL1/CR1 register (bit10) and libopencm3's TIM_CR1_*
+** macros don't know about it, so this silently clears PMEN on every
+** single commutation. PMEN_REASSERT() (below) is called defensively
+** at every point this file is about to rely on TIM2 behaving as
+** 32-bit (top of tim2_isr(), around the confirm-path iftim_isr() call)
+** to bound how long it can stay cleared to, at most, one commutation-
+** to-next-confirm interval.
 */
 
 #include <libopencm3/cm3/common.h>
@@ -15,52 +72,113 @@
 #include "common.h"
 #include "artery_hal.h"
 
-// Called explicitly from tim3_isr() below, NOT bound to any vector
-// (see config.h's top comment) -- upstream's own prototype lives in
-// src/common.h only for functions OWNED by config.c; iftim_isr() is
-// owned by src/main.c (unmodified), so it needs its own declaration
-// here.
+// Called explicitly from dma1_channel1_isr()/tim2_isr() below, NOT
+// bound to any vector (see config.h's top comment) -- upstream's own
+// prototype lives in src/common.h only for functions OWNED by
+// config.c; iftim_isr() is owned by src/main.c (unmodified), so it
+// needs its own declaration here.
 void iftim_isr(void);
 
+// CTRL1 bit10 (PMEN / "Plus Mode", i.e. 32-bit counting) -- reserved/
+// unused at this bit position on real STM32 TIM_CR1, so libopencm3 has
+// no macro for it. See artery_hal.c's at32f425_tmr.h cross-reference
+// (tmr_32_bit_function_enable() sets exactly this bit) and this file's
+// top comment for why it must be re-asserted defensively.
+#define TIM_CR1_PMEN_BIT (1u << 10)
+#define PMEN_REASSERT() (TIM2_CR1 |= TIM_CR1_PMEN_BIT)
+
 #ifdef BENCH_TEST
-// AT32F425-only bench harness: bounded, logged first-spin validation of
-// upstream ESCape32's own startup/ADC-ZC/break-before-make path, NOT a
-// new stage_eXX-style FSM -- shared src/* motor-control code is
-// untouched; throttle is injected via upstream's own ANALOG+THROT_SET
-// mechanism (see add_target(MOUSEF425_BENCH ...), CMakeLists.txt),
-// which skips initio()/IOTIM entirely (src/main.c: `#ifndef ANALOG
-// initio(); #endif`) so no DSHOT/servo decode runs at all -- `throt`
-// is simply left at its cfg.throt_set-initialized value forever, since
-// this bench build's adctrig() never calls adcdata()'s analog-throttle
-// path. All counters/log fields below are read via debugger/OpenOCD
-// after the run, the same way Stage E24-E26 read back their results.
-#define BENCH_TIME_LIMIT_TICKS 200 // 200 * 10ms = 2.0s
-#define BENCH_COMMUTATION_LIMIT 60
-#define BENCH_POST_ZC_COMMUTATION_LIMIT 12 // Stop after this many successful commutations following the first ADC-ZC confirm
+// Read-only diagnostic visibility into upstream's iftim_isr() accept/
+// reject decision (src/main.c: `if (t < ival >> 1) return;`) -- step/
+// ival had `static` removed (main.c, zero behavior change) specifically
+// for this. The algorithm itself is not touched anywhere.
+extern int step, ival;
+#endif
 
-enum { BENCH_STOP_NONE = 0, BENCH_STOP_COMMUTATION_LIMIT, BENCH_STOP_TIME_LIMIT, BENCH_STOP_POST_ZC_LIMIT, BENCH_STOP_FAULT };
+#ifdef BENCH_TEST
+// AT32F425-only bench harness: bounded, logged staged-duty acceleration
+// validation of upstream ESCape32's own startup/ADC-ZC/break-before-
+// make path, NOT a new stage_eXX-style FSM -- shared src/* motor-
+// control code is untouched. Throttle is injected via upstream's own
+// ANALOG mechanism (see add_target(MOUSEF425_BENCH ...), CMakeLists.txt
+// -- skips initio()/IOTIM entirely, `throt` is fully ours to write).
+// The per-stage duty CEILING is injected by directly mutating the
+// already-runtime-mutable `cfg.duty_max`/`cfg.duty_spup` fields (the
+// same fields execcmd()'s USB config commands mutate on real products)
+// while `throt` itself is simply held at max (2000) throughout -- this
+// hits each stage's target duty EXACTLY, rather than needing to invert
+// upstream's throttle->duty scale() formula per stage. ADC-ZC
+// threshold/CH4 sampling/timing advance/break-before-make are
+// untouched. All fields below are read via debugger/OpenOCD after the
+// run, same as Stage E24-E26/the first BENCH_TEST run.
+#define BENCH_TIME_LIMIT_TICKS 100 // 100 * 10ms = 1.0s hard overall limit
+#define BENCH_POST_ZC_COMMUTATION_LIMIT 12 // Advance/stop after this many successful commutations following each stage's first ADC-ZC confirm
+#define BENCH_NUM_STAGES 4
 
-// Internal bookkeeping only (not part of the read-back log set) --
-// commutation count snapshotted the instant bench_zc_reached first
-// became true, so BENCH_POST_ZC_COMMUTATION_LIMIT can be checked as a
-// simple difference without adding another log field.
-static uint32_t bench_commutation_count_at_zc;
+// DIAGNOSTIC HOLD (per instruction): duty pinned at 15% on all "stages"
+// until iftim_isr() accept/reject is confirmed working end-to-end again
+// on the migrated TIM2 IFTIM -- the 20/30/40% entries return once that
+// is reconfirmed.
+static const uint8_t bench_stage_duty[BENCH_NUM_STAGES] = {15, 15, 15, 15};
 
-volatile uint32_t bench_commutation_count;   // TIM1 COM events actually committed (tim3_isr's CC3 handler)
-volatile uint32_t bench_confirm_count;       // ADC-ZC schmitt-trigger confirms (dma1_channel1_isr)
-volatile uint32_t bench_zc_accepted_count;   // Confirms iftim_isr() itself accepted (CCR3 actually changed, not an early `t<ival>>1` reject)
-// Min/max measured inter-commutation interval, in 100us units. NOTE:
-// TIM7_CNT alone wraps every 10ms (ARR=99, see bench_test_init()) --
-// too often to time-stamp commutation gaps that can span tens of ms --
-// so the timestamp used here is a WIDE one combining the slow 10ms
-// tick count with TIM7's own sub-tick count (bench_wide_timestamp()).
-volatile uint32_t bench_ival_min_100us = 0xFFFFFFFFu;
-volatile uint32_t bench_ival_max_100us;
-volatile uint32_t bench_last_commit_100us;
-volatile int bench_zc_reached;               // First ADC-ZC confirm seen -> genuinely left open-loop startup
+#define BENCH_CONFIRM_LOG_N 16
+typedef struct {
+	uint32_t cval_at_confirm; // TIM2_CNT (=upstream's `t`) read just before calling iftim_isr() -- no capture register involved
+	uint32_t ival_snapshot;   // upstream's `ival`, read at the same moment (see extern above)
+	uint32_t ival_half;       // ival_snapshot >> 1 -- the exact threshold `t` is compared against
+	uint8_t accepted;         // 1 if iftim_isr() actually updated IFTIM_OCR (accepted), 0 if rejected
+	uint8_t step_snapshot;    // upstream's `step` (1-6) at the same moment
+	int8_t floating_phase;    // 0/1/2 = A/B/C (this backend's at32_adc_buf index), -1 = disarmed
+	uint8_t polarity;         // compctl()'s x&4 bit for the sector that armed this confirm
+	uint32_t since_commit_100us;       // elapsed time from the most recent commit to this confirm, 100us units
+	uint32_t confirm_timestamp_100us;  // Absolute bench_wide_timestamp() at this confirm
+	uint32_t since_prev_confirm_100us; // confirm_timestamp_100us minus the PREVIOUS confirm's (any confirm, accepted or not) -- 0 for the first-ever confirm
+} bench_confirm_log_t;
+volatile bench_confirm_log_t bench_confirm_log[BENCH_CONFIRM_LOG_N];
+volatile uint32_t bench_confirm_log_count; // Total confirms seen (keeps counting past BENCH_CONFIRM_LOG_N)
+
+enum { BENCH_STOP_NONE = 0, BENCH_STOP_ALL_STAGES_DONE, BENCH_STOP_TIME_LIMIT, BENCH_STOP_FAULT, BENCH_STOP_UNSAFE_RESET };
+
+// Reset cause (AT32_RESET_CAUSE_* bitmask, artery_hal.h), read/cleared
+// in init() BEFORE at32_clock_init() (crm_reset() may clear the CRM
+// flags). A non-power-on cause holds the motor off entirely for the
+// rest of this boot -- see bench_test_init().
+volatile unsigned bench_reset_cause;
+
+typedef struct {
+	uint32_t duty_percent;
+	uint32_t confirm_count;       // ADC-ZC schmitt-trigger confirms this stage (candidates only -- see zc_accepted_count for the accept-gated count)
+	uint32_t zc_accepted_count;   // Of those, how many iftim_isr() itself accepted (IFTIM_OCR actually changed, not an early `t<ival>>1` reject)
+	uint32_t commutation_count;   // TIM1 COM events committed this stage
+	uint32_t uif_count;           // IFTIM timeouts this stage (expected during this stage's own initial ramp, not necessarily a fault)
+	uint32_t fault_count;         // 0 or 1 -- see tim3_isr()'s fault trigger
+	// ival ESTIMATE reconstructed from IFTIM_OCR via upstream's own
+	// formula inverted: OCR = max((ival-(ival*cfg.timing>>5))>>1, 1);
+	// with cfg.timing left at its default (16, not overridden by this
+	// target), that reduces to OCR ~= ival/4, so ival ~= OCR*4. This is
+	// an approximation (integer truncation in the original formula is
+	// not perfectly invertible) -- NOT a direct read of upstream's
+	// `ival` (that IS separately available now via the extern above,
+	// but this field predates that and is kept as a cross-check). The
+	// independently, directly MEASURED wall-clock gap between commits
+	// (interval_100us_*) is the authoritative figure.
+	uint32_t ival_est_min_ticks, ival_est_max_ticks, ival_est_sum_ticks, ival_est_n;
+	// Directly measured (TIM7-derived wide timestamp) inter-commit gap, 100us units.
+	uint32_t interval_100us_min, interval_100us_max, interval_100us_sum, interval_100us_n;
+} bench_stage_log_t;
+
+volatile bench_stage_log_t bench_stage[BENCH_NUM_STAGES];
+volatile int bench_stage_index;      // 0..BENCH_NUM_STAGES-1 while running
+volatile int bench_stage_zc_reached; // Per-stage: first ACCEPTED ADC-ZC confirm seen in the CURRENT stage
 volatile int bench_stopped;
 volatile int bench_stop_reason; // BENCH_STOP_*
 volatile uint32_t bench_elapsed_ticks; // TMR7 overflow count, 10ms/tick
+
+// Internal bookkeeping only (not part of the read-back log set).
+static uint32_t bench_stage_commutation_count_at_zc; // This stage's commutation_count snapshotted when bench_stage_zc_reached first became true
+static uint32_t bench_last_commit_100us;             // Global (spans stage transitions -- a transition's own interval sample is real, just attributed to whichever stage is current at commit time)
+static uint32_t bench_last_target_ticks;             // Most recent accepted IFTIM_OCR, for the ival_est_* reconstruction
+static uint32_t bench_last_confirm_100us;            // Any confirm, accepted or not -- confirm-to-confirm spacing
 
 static uint32_t bench_wide_timestamp(void) {
 	// Two reads race against a TIM7 overflow landing in between (e.g.
@@ -83,10 +201,31 @@ static void bench_force_stop(int reason) {
 	throt = 0; // Also tell upstream's own control loop to want zero throttle from here on
 }
 
+static void bench_apply_stage(int idx) {
+	bench_stage_index = idx;
+	bench_stage_zc_reached = 0;
+	bench_stage_commutation_count_at_zc = 0;
+	bench_stage[idx].duty_percent = bench_stage_duty[idx];
+	cfg.duty_max = bench_stage_duty[idx];
+	cfg.duty_spup = bench_stage_duty[idx]; // DUTY_RAMP=0 (default, not overridden) makes duty_spup an independent, otherwise-fixed ceiling -- keep it in lockstep with duty_max so it never masks the stage's intended duty
+}
+
 void tim7_isr(void) {
 	if (!(TIM7_SR & TIM_SR_UIF)) return;
 	TIM7_SR = (uint16_t)~TIM_SR_UIF;
-	if (bench_stopped) return;
+	if (bench_stopped) {
+		// Independent of TIM2/TIM3/the motor-control path entirely (TIM7
+		// is our own peripheral, always running once this is set up) --
+		// this is the belt-and-suspenders enforcement for the
+		// unsafe-reset case: if the motor never starts (throt stays 0),
+		// neither TIM2's nor TIM3's interrupts may ever fire at all,
+		// meaning their own MOE-off reassertions (see tim3_isr()'s
+		// stopped-branch) would never run either. TIM7 fires every 10ms
+		// unconditionally, so this is what actually guarantees MOE stays
+		// off for the unsafe-reset case specifically.
+		TIM1_BDTR &= ~TIM_BDTR_MOE;
+		return;
+	}
 	if (++bench_elapsed_ticks >= BENCH_TIME_LIMIT_TICKS) bench_force_stop(BENCH_STOP_TIME_LIMIT);
 }
 
@@ -101,6 +240,26 @@ static void bench_test_init(void) {
 	nvic_set_priority(NVIC_TIM7_IRQ, 0x40);
 	nvic_enable_irq(NVIC_TIM7_IRQ);
 	TIM7_CR1 = TIM_CR1_CEN | TIM_CR1_URS;
+
+	// Reset-safety gate: refuse to auto-start the motor after any
+	// non-power-on reset (external/SW/WDT/WWDT/lowpower) -- an
+	// unexpected reset mid-run must not be followed by an automatic
+	// restart. bench_reset_cause was captured in init(), before
+	// at32_clock_init(). MOE=0 is asserted once immediately here and
+	// then continuously by this function's own tim7_isr() every 10ms
+	// (above) for as long as bench_stopped stays set -- which, since
+	// bench_force_stop() is never called to UN-set it, is until the
+	// next power-on reset or an explicit debugger write of
+	// bench_stopped=0 (never done automatically by this firmware).
+	if (bench_reset_cause & ~(unsigned)AT32_RESET_CAUSE_POR) {
+		bench_stopped = 1;
+		bench_stop_reason = BENCH_STOP_UNSAFE_RESET;
+		TIM1_BDTR &= ~TIM_BDTR_MOE;
+		return; // throt stays 0 -- main()'s control loop never sets running=1
+	}
+
+	throt = 2000; // Max commanded throttle -- actual output is capped by cfg.duty_max/duty_spup per stage, see bench_apply_stage()
+	bench_apply_stage(0);
 }
 #endif
 
@@ -156,6 +315,9 @@ static volatile int zc_floating_idx = -1; // -1 = disarmed (compctl(0), e.g. at 
 static volatile int zc_blank_remaining;
 typedef struct { int confirmed_sign; int confirm_run; } zc_filter_t;
 static volatile zc_filter_t zc_rise, zc_fall;
+#ifdef BENCH_TEST
+static volatile uint8_t zc_armed_polarity; // Most recent compctl() x&4 bit, for the confirm log
+#endif
 
 void compctl(int x) {
 	int sel = x & 3;
@@ -164,6 +326,9 @@ void compctl(int x) {
 		return;
 	}
 	zc_floating_idx = comp_in_to_adc_idx[sel];
+#ifdef BENCH_TEST
+	zc_armed_polarity = (x & 4) ? 1 : 0;
+#endif
 	zc_rise.confirmed_sign = -1;
 	zc_rise.confirm_run = 0;
 	zc_fall.confirmed_sign = 1;
@@ -192,6 +357,33 @@ static int zc_filter_update(volatile zc_filter_t *f, int diff) {
 	return 0;
 }
 
+// Resynchronizes TIM3 (the 2us break-before-make scheduler) to a fresh
+// IFTIM_OCR target -- called every time IFTIM (TIM2) was just reset
+// (either because iftim_isr() accepted a real ZC, or because tim2_isr()
+// is repeating the bootstrap/timeout cycle -- see this file's top
+// comment). TIM3 runs at the identical 500ns/tick rate as TIM2, so
+// `target` is used directly with no unit conversion. This function
+// touches ONLY TIM3's own registers -- it never reads or writes
+// anything on TIM2 itself.
+static void iftim_reschedule(uint16_t target) {
+	TIM3_EGR = TIM_EGR_UG; // Reset TIM3 to 0, synchronized with IFTIM's own reset
+	// GATE_OFF_ADVANCE_TICKS can exceed target at very short
+	// commutation intervals (IFTIM_OCR's own floor is 1, see main.c) --
+	// when there isn't enough of the interval left for a break, skip
+	// the gate-off phase for this one cycle rather than mis-schedule
+	// it; the commit (CC3, always upstream's own already-valid target)
+	// still happens on time.
+	if (target > GATE_OFF_ADVANCE_TICKS) {
+		TIM3_CCR2 = (uint16_t)(target - GATE_OFF_ADVANCE_TICKS);
+		TIM3_DIER |= TIM_DIER_CC2IE;
+	} else {
+		TIM3_DIER &= ~TIM_DIER_CC2IE;
+	}
+	TIM3_CCR3 = target;
+	TIM3_SR = (uint16_t)~(TIM_SR_CC2IF | TIM_SR_CC3IF); // Drop stale flags from the just-UG'd counter
+	TIM3_DIER |= TIM_DIER_CC3IE;
+}
+
 void dma1_channel1_isr(void) {
 	if (!at32_bemf_dma_transfer_complete()) return; // Artery-facing flag check -- see artery_hal.h
 	if (zc_floating_idx < 0) return;
@@ -208,38 +400,73 @@ void dma1_channel1_isr(void) {
 		return;
 	}
 	if (zc_filter_update(&zc_rise, diff) || zc_filter_update(&zc_fall, diff)) {
+#ifdef BENCH_TEST
+		int8_t confirm_phase = (int8_t)zc_floating_idx;
+		uint32_t confirm_now = 0, confirm_since_commit = 0, confirm_since_prev = 0;
+		uint32_t diag_cval = 0, diag_ival = 0;
+		uint8_t diag_step = 0;
+		if (!bench_stopped) {
+			confirm_now = bench_wide_timestamp();
+			confirm_since_commit = bench_last_commit_100us ? confirm_now - bench_last_commit_100us : 0;
+			confirm_since_prev = bench_last_confirm_100us ? confirm_now - bench_last_confirm_100us : 0;
+			bench_last_confirm_100us = confirm_now;
+			bench_stage[bench_stage_index].confirm_count++; // Candidate only -- accept/reject determined below
+			diag_cval = TIM2_CNT;
+			diag_ival = (uint32_t)ival;
+			diag_step = (uint8_t)step;
+		}
+#endif
+		uint32_t ccr3_before = TIM2_CCR3; // Always needed -- accept detection is not BENCH_TEST-only
 		zc_floating_idx = -1; // Disarm until compctl() re-arms for the next sector
-		TIM3_EGR = TIM_EGR_CC1G; // Software "capture" -- Stage E24-validated: captures current
-		                          // CNT into CCR1 and fires CC1 IRQ exactly like a real edge.
+
+		PMEN_REASSERT();
+		iftim_isr(); // Direct call -- IFTIM_ICR (=TIM2_CNT) is read live inside, no capture register involved
+		PMEN_REASSERT();
+
+		uint32_t ccr3_after = TIM2_CCR3;
+		int accepted = ccr3_after != ccr3_before;
+		if (accepted) iftim_reschedule((uint16_t)ccr3_after);
+
 #ifdef BENCH_TEST
 		if (!bench_stopped) {
-			bench_confirm_count++;
-			if (!bench_zc_reached) {
-				bench_zc_reached = 1;
-				bench_commutation_count_at_zc = bench_commutation_count;
+			if (accepted) {
+				bench_stage[bench_stage_index].zc_accepted_count++;
+				bench_last_target_ticks = ccr3_after;
+				if (!bench_stage_zc_reached) {
+					bench_stage_zc_reached = 1;
+					bench_stage_commutation_count_at_zc = bench_stage[bench_stage_index].commutation_count;
+				}
+			}
+			uint32_t n = bench_confirm_log_count++;
+			if (n < BENCH_CONFIRM_LOG_N) {
+				volatile bench_confirm_log_t *e = &bench_confirm_log[n];
+				e->cval_at_confirm = diag_cval;
+				e->ival_snapshot = diag_ival;
+				e->ival_half = diag_ival >> 1;
+				e->accepted = (uint8_t)accepted;
+				e->step_snapshot = diag_step;
+				e->floating_phase = confirm_phase;
+				e->polarity = zc_armed_polarity;
+				e->since_commit_100us = confirm_since_commit;
+				e->confirm_timestamp_100us = confirm_now;
+				e->since_prev_confirm_100us = confirm_since_prev;
 			}
 		}
 #endif
 	}
 }
 
-// F425-specific commutation scheduler. Wraps upstream's unmodified
-// iftim_isr() (called explicitly, NOT bound to this vector -- see
-// config.h). Upstream computes IFTIM_OCR (=TIM3_CCR3) as the delay to
-// the next commutation and, on real STM32/AT32F421, relies on a
-// hardware TRGO->TIM1-COM path to act on it (not used here -- see
-// config.h). Instead we independently re-arm TIM3 CC2 (gate-off, 2us
-// before target) and CC3 (commit, at target) every cycle, since
-// upstream unconditionally rewrites TIM_DIER(IFTIM) on every call.
+// F425-specific 2us break-before-make scheduler. Purely reactive to
+// TIM3's own CC2 (gate-off)/CC3 (commit) compare events -- see
+// iftim_reschedule() for how those get programmed, and this file's top
+// comment for the full accept/timeout flow. No IFTIM/UIF logic lives
+// here anymore (that moved to tim2_isr()).
 //
-// KNOWN SIMPLIFICATION (flagged, not yet hardware-hardened): this
-// processes UIF/CC1IF/CC2IF/CC3IF as independent sequential ifs against
-// one SR snapshot rather than re-reading SR after each action. At the
-// commutation rates this design targets that should be safe, but this
-// is the least hardware-validated new code in this port (unlike TIM1
-// PWM/GPIO/ADC/DMA, which reuse Stage A-E26-confirmed values) and is
-// exactly the kind of thing Stage E24-E26 verified empirically before
-// being trusted -- expect this scheduler specifically may need its own
+// KNOWN SIMPLIFICATION (flagged, not yet hardware-hardened): CC2IF/
+// CC3IF are processed as independent ifs against one SR snapshot
+// rather than re-reading SR after each action. At the commutation
+// rates this design targets that should be safe, but this remains the
+// least hardware-validated new code in this port and may need its own
 // bring-up-style verification pass before being trusted at speed.
 void tim3_isr(void) {
 #ifdef BENCH_TEST
@@ -250,56 +477,6 @@ void tim3_isr(void) {
 	}
 #endif
 	uint32_t sr = TIM3_SR;
-	if (sr & (TIM_SR_UIF | TIM_SR_CC1IF)) {
-#ifdef BENCH_TEST
-		uint16_t ccr3_before = (uint16_t)TIM3_CCR3;
-#endif
-		iftim_isr();
-#ifdef BENCH_TEST
-		if (!(sr & TIM_SR_UIF) && (uint16_t)TIM3_CCR3 != ccr3_before) bench_zc_accepted_count++;
-#endif
-		if (sr & TIM_SR_UIF) {
-			// Sync-loss timeout (see iftim_isr()'s UIF branch, src/main.c):
-			// IFTIM_OCR/CCR3 was NOT updated by this call and still holds
-			// a stale, meaningless target -- do NOT reschedule CC2/CC3 off
-			// it. Disarm both and make sure we never leave gates stuck off
-			// from a prior cycle's gate-off (CC2) that never got a
-			// matching commit (CC3) before sync was declared lost.
-			TIM3_DIER &= ~(TIM_DIER_CC2IE | TIM_DIER_CC3IE);
-			TIM3_SR = (uint16_t)~(TIM_SR_CC2IF | TIM_SR_CC3IF);
-			TIM1_BDTR |= TIM_BDTR_MOE;
-#ifdef BENCH_TEST
-			// A UIF timeout during the initial open-loop ramp is normal
-			// (ARR/OCR are both set to the same large startup value in
-			// main()'s "Start motor" sequence, so early commutations are
-			// legitimately UIF-driven -- confirmed by the first bounded
-			// run: 4 commutations at a rock-steady ~32.7ms, exactly
-			// IFTIM's ARR period). Only treat it as a fault once we'd
-			// already reached real ADC-ZC-driven operation and then lost
-			// it -- that is an actual desync/stall, not startup ramping.
-			if (!bench_stopped && bench_zc_reached) bench_force_stop(BENCH_STOP_FAULT);
-#endif
-		} else {
-			uint16_t target = (uint16_t)TIM3_CCR3;
-			// GATE_OFF_ADVANCE_TICKS can exceed target at very short
-			// commutation intervals (IFTIM_OCR's own floor is 1, see
-			// main.c) -- a plain subtraction would wrap a uint16_t to
-			// near-ARR and schedule gate-off ~32ms in the future instead
-			// of 2us before commit. When there isn't enough of the
-			// interval left for a break, skip the gate-off phase for
-			// this one cycle rather than mis-schedule it; the commit
-			// (CC3, always upstream's own already-valid target) still
-			// happens on time.
-			if (target > GATE_OFF_ADVANCE_TICKS) {
-				TIM3_CCR2 = (uint16_t)(target - GATE_OFF_ADVANCE_TICKS);
-				TIM3_DIER |= TIM_DIER_CC2IE;
-			} else {
-				TIM3_DIER &= ~TIM_DIER_CC2IE;
-			}
-			TIM3_SR = (uint16_t)~(TIM_SR_CC2IF | TIM_SR_CC3IF); // Drop stale flags from the just-UG'd counter
-			TIM3_DIER |= TIM_DIER_CC3IE;
-		}
-	}
 	if (sr & TIM_SR_CC2IF) {
 		TIM3_SR = (uint16_t)~TIM_SR_CC2IF;
 		TIM1_BDTR &= ~TIM_BDTR_MOE; // All outputs Hi-Z -- break-before-make starts
@@ -311,25 +488,83 @@ void tim3_isr(void) {
 		TIM1_BDTR |= TIM_BDTR_MOE; // Re-open gates -- the correct new sector is already active
 #ifdef BENCH_TEST
 		if (!bench_stopped) {
-			uint32_t now = bench_wide_timestamp(); // 100us units, monotonic across the whole bounded run
-			if (bench_commutation_count) { // Skip the very first commit -- no valid prior timestamp yet
-				uint32_t interval = now - bench_last_commit_100us;
-				if (interval < bench_ival_min_100us) bench_ival_min_100us = interval;
-				if (interval > bench_ival_max_100us) bench_ival_max_100us = interval;
-			}
-			bench_last_commit_100us = now;
-			++bench_commutation_count;
-			if (bench_commutation_count >= BENCH_COMMUTATION_LIMIT) {
-				bench_force_stop(BENCH_STOP_COMMUTATION_LIMIT);
-			} else if (bench_zc_reached && bench_commutation_count - bench_commutation_count_at_zc >= BENCH_POST_ZC_COMMUTATION_LIMIT) {
-				bench_force_stop(BENCH_STOP_POST_ZC_LIMIT);
+			if (!(TIM1_BDTR & TIM_BDTR_MOE)) {
+				// Driver all-off suspicion: we just wrote MOE=1 above and
+				// it reads back low -- something external (a hardware
+				// BRK/fault input, or the driver itself) is holding the
+				// outputs off despite our request. Stop immediately.
+				bench_stage[bench_stage_index].fault_count = 1;
+				bench_force_stop(BENCH_STOP_FAULT);
+			} else {
+				volatile bench_stage_log_t *s = &bench_stage[bench_stage_index];
+				uint32_t now = bench_wide_timestamp(); // 100us units, monotonic across the whole bounded run
+				if (bench_last_commit_100us) { // Skip the very first-ever commit -- no valid prior timestamp yet
+					uint32_t interval = now - bench_last_commit_100us;
+					if (!s->interval_100us_n || interval < s->interval_100us_min) s->interval_100us_min = interval;
+					if (interval > s->interval_100us_max) s->interval_100us_max = interval;
+					s->interval_100us_sum += interval;
+					s->interval_100us_n++;
+				}
+				bench_last_commit_100us = now;
+				if (bench_last_target_ticks) { // Set once iftim_isr() has accepted at least one real ZC
+					uint32_t ival_est = bench_last_target_ticks * 4u;
+					if (!s->ival_est_n || ival_est < s->ival_est_min_ticks) s->ival_est_min_ticks = ival_est;
+					if (ival_est > s->ival_est_max_ticks) s->ival_est_max_ticks = ival_est;
+					s->ival_est_sum_ticks += ival_est;
+					s->ival_est_n++;
+				}
+				s->commutation_count++;
+				if (bench_stage_zc_reached && s->commutation_count - bench_stage_commutation_count_at_zc >= BENCH_POST_ZC_COMMUTATION_LIMIT) {
+					if (bench_stage_index + 1 < BENCH_NUM_STAGES) bench_apply_stage(bench_stage_index + 1);
+					else bench_force_stop(BENCH_STOP_ALL_STAGES_DONE);
+				}
 			}
 		}
 #endif
 	}
 }
 
+// IFTIM's (TIM2) own UIF/timeout interrupt -- the ONLY thing TIM2's
+// vector is used for; real ZC confirms call iftim_isr() directly from
+// dma1_channel1_isr() instead (see this file's top comment). CH1 is
+// never configured as a capture channel, so its CCR1/CC1x bits are
+// inert defaults -- TIM2_SR is defensively cleared in full after
+// processing, in case a spurious CC1-related flag (CH1's own compare-
+// match against its untouched, zero-valued CCR1) would otherwise sit
+// pending forever and storm the interrupt (upstream's own nextstep()
+// keeps IFTIM_ICIE, i.e. TIM2's CC1IE, enabled in DIER regardless).
+void tim2_isr(void) {
+	uint32_t sr = TIM2_SR;
+	if (!(sr & TIM_SR_UIF)) {
+		TIM2_SR = 0;
+		return;
+	}
+	PMEN_REASSERT();
+	iftim_isr(); // Clears UIF itself (src/main.c's UIF branch)
+	TIM2_SR = 0; // Defensively clear anything else (e.g. inert CH1 flags)
+	PMEN_REASSERT();
+	// Unconditional reschedule, using whatever IFTIM_OCR currently
+	// holds (unchanged by the UIF branch) -- reproduces the "commutate
+	// every ~32.7ms until a real ZC takes over" bootstrap behavior the
+	// old single-timer design got for free from hardware ARR==OCR
+	// coincidence (see this file's top comment).
+	iftim_reschedule((uint16_t)TIM2_CCR3);
+}
+
 void init(void) {
+#ifdef BENCH_TEST
+	// Must happen BEFORE at32_clock_init() (clock_config_96mhz() starts
+	// with crm_reset(), which may clear CRM's reset-cause flags) --
+	// see bench_test_init() for what this gates. NOTE: whether POR and
+	// NRST_PIN co-assert together on a genuine power-up on THIS
+	// silicon has not been independently confirmed yet (only debugger-
+	// initiated core resets have been observed so far) -- a real
+	// power-cycle test is needed to check that a legitimate power-on
+	// isn't ever misclassified as "unsafe" by bench_test_init()'s
+	// `& ~POR` check.
+	bench_reset_cause = at32_reset_cause_get();
+	at32_reset_cause_clear();
+#endif
 	at32_clock_init(); // Artery-facing (CRM/PLL) -- see artery_hal.c
 	at32_dma_flexible_routing_init(); // Artery-facing (DMA request routing) -- see artery_hal.c
 
@@ -342,7 +577,7 @@ void init(void) {
 	// exclusively via Artery calls in artery_hal.c, never here.
 	RCC_AHBENR = RCC_AHBENR_DMAEN | RCC_AHBENR_SRAMEN | RCC_AHBENR_GPIOAEN | RCC_AHBENR_GPIOBEN;
 	RCC_APB2ENR = RCC_APB2ENR_TIM1EN | RCC_APB2ENR_TIM15EN;
-	RCC_APB1ENR = RCC_APB1ENR_TIM3EN | RCC_APB1ENR_TIM6EN | RCC_APB1ENR_USART2EN;
+	RCC_APB1ENR = RCC_APB1ENR_TIM2EN | RCC_APB1ENR_TIM3EN | RCC_APB1ENR_TIM6EN | RCC_APB1ENR_USART2EN;
 	SCB_VTOR = (uint32_t)_rom; // Set vector table address
 
 	// TIM1 6PWM: PA7(CH1N)/PA8(CH1)/PA9(CH2)/PB0(CH2N)/PA10(CH3)/PB1(CH3N),
@@ -371,6 +606,36 @@ void init(void) {
 
 	at32_bemf_adc_dma_init(); // PA0/PA4/PA5 analog -- configured entirely inside artery_hal.c
 
+	// IFTIM = TIM2, 32-bit Plus Mode, 500ns/tick, free-running. CH1 is
+	// deliberately left unconfigured (reset default) -- no capture is
+	// used (see this file's top comment). Reset the peripheral first
+	// for a clean, known state before enabling Plus Mode.
+	RCC_APB1RSTR = RCC_APB1RSTR_TIM2RST;
+	RCC_APB1RSTR = 0;
+	PMEN_REASSERT(); // Must happen before/alongside TIM_CR1 setup below -- CEN is also in CR1
+	TIM_PSC(IFTIM) = (CLK_MHZ >> (IFTIM_XRES + 1)) - 1; // Same derivation as upstream's own main() would have used for a 16-bit IFTIM -- unchanged rate
+	TIM2_ARR = 0xFFFFFFFFu; // Full 32-bit range -- upstream's OWN later writes (e.g. "start motor": ARR=OCR=65535) narrow this per-operation; Plus Mode lets it actually reach those values without an incidental early wrap
+	TIM2_DIER = 0; // No interrupts yet -- upstream's own nextstep()/main() enable UIE/ICIE as needed
+	TIM2_EGR = TIM_EGR_UG;
+	PMEN_REASSERT(); // UG doesn't touch CR1, but re-assert once more defensively right before enabling the counter
+	TIM2_CR1 = TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_PMEN_BIT;
+
+	// TIM3 = 2us break-before-make scheduler ONLY, matching IFTIM's own
+	// 500ns/tick rate (no unit conversion needed between the two, see
+	// iftim_reschedule()). Plain 16-bit is sufficient -- this timer is
+	// reset (UG) at every accepted ZC / bootstrap retry, so it only
+	// ever needs to represent a single upcoming commutation's worth of
+	// ticks, and upstream's own IFTIM_OCR ceiling (65535) already fits.
+	// No CH1 capture-mode setup needed here anymore (that requirement
+	// moved away entirely with the software-capture design -- TIM3 no
+	// longer does any capture at all).
+	TIM_PSC(TIM3) = (CLK_MHZ >> (IFTIM_XRES + 1)) - 1;
+	TIM3_ARR = 0xFFFF;
+	TIM3_DIER = 0;
+	TIM3_EGR = TIM_EGR_UG;
+	TIM3_CR1 = TIM_CR1_CEN | TIM_CR1_ARPE;
+
+	nvic_set_priority(NVIC_TIM2_IRQ, 0x40);
 	nvic_set_priority(NVIC_TIM3_IRQ, 0x40);
 	nvic_set_priority(NVIC_TIM1_BRK_UP_TRG_COM_IRQ, 0x40);
 	nvic_set_priority(NVIC_DMA1_CHANNEL1_IRQ, 0x80);
@@ -380,6 +645,7 @@ void init(void) {
 	nvic_set_priority(NVIC_DMA1_CHANNEL4_7_DMA2_CHANNEL3_5_IRQ, 0x40);
 
 	nvic_enable_irq(NVIC_TIM1_BRK_UP_TRG_COM_IRQ);
+	nvic_enable_irq(NVIC_TIM2_IRQ);
 	nvic_enable_irq(NVIC_TIM3_IRQ);
 	nvic_enable_irq(NVIC_DMA1_CHANNEL1_IRQ);
 	nvic_enable_irq(NVIC_TIM15_IRQ);
