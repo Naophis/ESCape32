@@ -81,7 +81,12 @@ int throt, brake, ertm, erpm, temp1, temp2, volt, curr, csum, dshotval, beepval 
 char analog, telreq, telmode, telphid, flipdir, beacon, dshotext, rearm, auxup;
 uint32_t tick;
 
-static int oldstep, sine, cutback;
+static int oldstep, cutback;
+// sine: NOT static (unlike the rest of this line) purely so an
+// AT32F425 BENCH_TEST diagnostic build (mcu/AT32F425/config.c) can read
+// it read-only, to directly observe whether/when upstream's own sine-
+// startup ramp engages and hands over to 6-step. Zero behavior change.
+int sine;
 // step/ival: NOT static (unlike the rest of this line) purely so an
 // AT32F425 BENCH_TEST diagnostic build can `extern` them read-only for
 // per-confirm accept/reject logging (see mcu/AT32F425/config.c) --
@@ -121,8 +126,9 @@ static int getcode(void) {
 
 static void nextstep(void) {
 	if (sine) { // Sine startup
-		TIM_ARR(IFTIM) = IFTIM_OCR = sine;
-		TIM_EGR(IFTIM) = TIM_EGR_UG;
+		IFTIM_ARR_WRITE(sine);
+		IFTIM_OCR = sine;
+		IFTIM_RESET();
 		if (!prep && step) step = step * 60 - 59; // Switch over from 6-step
 		if (reverse) {
 			if (--step < 1) step = 360;
@@ -156,7 +162,7 @@ static void nextstep(void) {
 #endif
 		TIM1_CCER = er;
 		TIM1_EGR = TIM_EGR_UG | TIM_EGR_COMG;
-		TIM_DIER(IFTIM) = 0;
+		IFTIM_TIMEOUT_DISARM();
 		compctl(0);
 		sync = 0;
 		prep = 1;
@@ -290,7 +296,7 @@ static void nextstep(void) {
 		COMP_BLANK_CH4_SET(0);
 #endif
 		IFTIM_ICMR = IFTIM_ICM3;
-		TIM_CR1(IFTIM) = TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS;
+		IFTIM_CR1_WRITE(TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS);
 	} else if (ertm < 200) { // 300K+ ERPM
 #ifdef TIM1_CCR5
 		TIM1_CCR5 = 0;
@@ -298,7 +304,7 @@ static void nextstep(void) {
 		COMP_BLANK_CH4_SET(0);
 #endif
 		IFTIM_ICMR = IFTIM_ICM2;
-		TIM_CR1(IFTIM) = TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS;
+		IFTIM_CR1_WRITE(TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS);
 	} else if (ertm < 1000) { // 60K+ ERPM
 #ifdef TIM1_CCR5
 		TIM1_CCR5 = 0;
@@ -306,7 +312,7 @@ static void nextstep(void) {
 		COMP_BLANK_CH4_SET(0);
 #endif
 		IFTIM_ICMR = IFTIM_ICM1;
-		TIM_CR1(IFTIM) = TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS;
+		IFTIM_CR1_WRITE(TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS);
 	} else if (ertm < 2000) { // 30K+ ERPM
 #ifdef TIM1_CCR5
 		TIM1_CCR5 = 0;
@@ -314,7 +320,7 @@ static void nextstep(void) {
 		COMP_BLANK_CH4_SET(0);
 #endif
 		IFTIM_ICMR = IFTIM_ICM1;
-		TIM_CR1(IFTIM) = TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS | TIM_CR1_CKD_CK_INT_MUL_2;
+		IFTIM_CR1_WRITE(TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS | TIM_CR1_CKD_CK_INT_MUL_2);
 	} else { // Minimum PWM frequency
 #ifdef TIM1_CCR5
 		TIM1_CCR5 = IFTIM_ICFL << 2;
@@ -322,10 +328,10 @@ static void nextstep(void) {
 		COMP_BLANK_CH4_SET(IFTIM_ICFL << 2);
 #endif
 		IFTIM_ICMR = IFTIM_ICM1;
-		TIM_CR1(IFTIM) = TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS | TIM_CR1_CKD_CK_INT_MUL_4;
+		IFTIM_CR1_WRITE(TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS | TIM_CR1_CKD_CK_INT_MUL_4);
 	}
 	TIM_SR(IFTIM) = 0; // Clear BEMF events before enabling interrupts
-	TIM_DIER(IFTIM) = TIM_DIER_UIE | IFTIM_ICIE;
+	IFTIM_TIMEOUT_ARM();
 	buf[step - 1] = hall > 4000 ? hall << IFTIM_XRES : ival;
 	if (sync < 6) return;
 	ertm = (buf[0] + buf[1] + buf[2] + buf[3] + buf[4] + buf[5]) >> (IFTIM_XRES + 1); // Electrical revolution time (us)
@@ -381,16 +387,29 @@ void tim1_com_isr(void) {
 	nextstep();
 }
 
+// Extracted from iftim_isr()'s own timeout branch so a backend whose
+// IFTIM timeout doesn't arrive as IFTIM's own real hardware UIF (see
+// mcu/AT32F425/config.h/.c -- IFTIM's ARR is pinned at its 32-bit max
+// there, so it never genuinely overflows; a separate timer generates
+// the equivalent 32.767ms timeout instead) can invoke exactly this
+// processing directly, without needing to fabricate a real UIF/SR
+// state for iftim_isr() to detect. Behavior is unchanged for every
+// other target: iftim_isr() below still only reaches this via a
+// genuine hardware UIF, exactly as before.
+void iftim_timeout(void) {
+	TIM_SR(IFTIM) = ~TIM_SR_UIF;
+	IFTIM_TIMEOUT_DISARM();
+	sync = 0;
+	fast = 0;
+	ival = 10000 << IFTIM_XRES;
+	ertm = 100000000;
+}
+
 void iftim_isr(void) { // BEMF zero-crossing
 	int er = TIM_DIER(IFTIM);
 	int sr = TIM_SR(IFTIM);
 	if ((er & TIM_DIER_UIE) && (sr & TIM_SR_UIF)) { // Timeout
-		TIM_SR(IFTIM) = ~TIM_SR_UIF;
-		TIM_DIER(IFTIM) = 0;
-		sync = 0;
-		fast = 0;
-		ival = 10000 << IFTIM_XRES;
-		ertm = 100000000;
+		iftim_timeout();
 		return;
 	}
 	if (!(er & IFTIM_ICIE)) return;
@@ -400,8 +419,8 @@ void iftim_isr(void) { // BEMF zero-crossing
 	fast = (t < u >> 2 || t > u >> 1) && ertm < 2000; // Fast acceleration/deceleration
 	ival = (t + u) >> 2; // Commutation interval
 	IFTIM_OCR = max((ival - (ival * cfg.timing >> 5)) >> 1, 1); // Commutation delay
-	TIM_EGR(IFTIM) = TIM_EGR_UG;
-	TIM_DIER(IFTIM) = 0;
+	IFTIM_RESET();
+	IFTIM_TIMEOUT_DISARM();
 	if (sync < 6) ++sync;
 }
 
@@ -492,6 +511,7 @@ void pend_sv_handler(void) {
 }
 
 void hard_fault_handler(void) {
+	HARDFAULT_CAPTURE(); // Must be first -- see src/defs.h
 	ledctl(1); // Indicate error
 	TIM1_EGR = TIM_EGR_BG;
 	TIM6_PSC = CLK_KHZ / 10 - 1; // 0.1ms resolution
@@ -590,10 +610,10 @@ void main(void) {
 	TIM1_CR2 = TIM_CR2_CCPC | TIM_CR2_CCUS | TIM_CR2_MMS_COMPARE_PULSE; // TRGO=OC1
 #endif
 	TIM_PSC(IFTIM) = (CLK_MHZ >> (IFTIM_XRES + 1)) - 1; // 125/250/500ns resolution
-	TIM_ARR(IFTIM) = 0;
-	TIM_CR1(IFTIM) = TIM_CR1_URS;
-	TIM_EGR(IFTIM) = TIM_EGR_UG;
-	TIM_CR1(IFTIM) = TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS;
+	IFTIM_ARR_WRITE(0);
+	IFTIM_CR1_WRITE(TIM_CR1_URS);
+	IFTIM_RESET();
+	IFTIM_CR1_WRITE(TIM_CR1_CEN | TIM_CR1_ARPE | TIM_CR1_URS);
 #ifdef HALL_MAP
 	if (!brushed && getcode() != 7) { // Hybrid mode
 		TIM3_CCMR1 = TIM_CCMR1_CC1S_IN_TRC | TIM_CCMR1_IC1F_DTF_DIV_8_N_8;
@@ -728,8 +748,8 @@ void main(void) {
 				int b = a / 60;
 				int c = b * 60;
 				IFTIM_OCR = sine * (reverse ? (void)(++b == 6 && (b = 0)), a - c + 1 : c - a + 60); // Commutation delay
-				TIM_ARR(IFTIM) = (1 << (IFTIM_XRES + 16)) - 1;
-				TIM_EGR(IFTIM) = TIM_EGR_UG;
+				IFTIM_ARR_WRITE((1 << (IFTIM_XRES + 16)) - 1);
+				IFTIM_RESET();
 				step = b + 1;
 			}
 			sine = 0;
@@ -819,8 +839,9 @@ void main(void) {
 #else
 			TIM1_DIER |= TIM_DIER_COMIE;
 #endif
-			TIM_ARR(IFTIM) = IFTIM_OCR = (1 << (IFTIM_XRES + 16)) - 1;
-			TIM_EGR(IFTIM) = TIM_EGR_UG;
+			IFTIM_ARR_WRITE((1 << (IFTIM_XRES + 16)) - 1);
+			IFTIM_OCR = (1 << (IFTIM_XRES + 16)) - 1;
+			IFTIM_RESET();
 			__enable_irq();
 			initpid(&bpid, 10000 << IFTIM_XRES);
 			boost = 0;
@@ -831,9 +852,9 @@ void main(void) {
 #else
 			TIM1_DIER &= ~TIM_DIER_COMIE;
 #endif
-			TIM_DIER(IFTIM) = 0;
-			TIM_ARR(IFTIM) = 0;
-			TIM_EGR(IFTIM) = TIM_EGR_UG;
+			IFTIM_TIMEOUT_DISARM();
+			IFTIM_ARR_WRITE(0);
+			IFTIM_RESET();
 			laststep();
 			sync = 0;
 			fast = 0;

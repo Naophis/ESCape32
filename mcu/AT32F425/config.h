@@ -32,9 +32,13 @@
 **   TIM2  : IFTIM -- upstream's BEMF timing core (iftim_isr()/ival/
 **           timing advance), 32-bit "Plus Mode" (PMEN), 0.5us/tick.
 **           TIM2_CNT is read LIVE (not via a capture register) as
-**           IFTIM_ICR -- see config.c's ADC-ZC confirm handler.
+**           IFTIM_ICR -- see config.c's ADC-ZC confirm handler. PMEN=1
+**           and ARR=0xFFFFFFFF are PERMANENT invariants -- never
+**           changed again after init(), by anyone (see below).
 **   TIM3  : 2us break-before-make scheduler ONLY. No longer IFTIM.
-**   TIM7  : BENCH_TEST elapsed-time watchdog
+**   TIM7  : Independent 32.767ms IFTIM-timeout generator (replaces
+**           IFTIM's own ARR-overflow-driven UIF).
+**   TIM14 : BENCH_TEST elapsed-time watchdog (moved off TIM7).
 **   TIM15 : IOTIM/DSHOT
 **
 ** IFTIM was originally TIM3 (16-bit). Stage E27 found upstream's own
@@ -60,14 +64,27 @@
 ** TIM2 hardware limitation.
 **
 ** upstream's own nextstep() does `TIM_CR1(IFTIM) = TIM_CR1_CEN |
-** TIM_CR1_ARPE | TIM_CR1_URS [| ...];` -- a PLAIN, WHOLE-REGISTER
-** assignment, every commutation. Since PMEN lives in that same CTRL1/
-** CR1 register (bit10) and libopencm3's TIM_CR1_* macros don't know
-** about it, this write silently clears PMEN on every single
-** commutation. config.c re-asserts PMEN defensively at every point it
-** (or upstream, via a call config.c makes) is about to rely on TIM2's
-** 32-bit behavior, bounding how long it can stay cleared -- see
-** config.c's PMEN_REASSERT use sites.
+** TIM_CR1_ARPE | TIM_CR1_URS [| ...];` every commutation -- a PLAIN,
+** WHOLE-REGISTER assignment that would silently clear PMEN (bit10,
+** unknown to libopencm3's TIM_CR1_* macros) on every single
+** commutation, and upstream also routinely tries to set IFTIM's ARR to
+** 0/0xFFFF (16-bit-timer assumptions baked into its own startup/stop
+** logic) -- which, if it ever actually reached real hardware even
+** momentarily WHILE the counter is running, can race a real auto-
+** reload/wrap and permanently corrupt the "ticks since last reset"
+** value (a repair after the fact, however immediate, cannot undo a
+** wrap that already happened in hardware). Rather than repairing these
+** after the fact, this port ABSORBS them: src/defs.h defines portable
+** IFTIM_CR1_WRITE(v)/IFTIM_ARR_WRITE(v)/IFTIM_RESET()/
+** IFTIM_TIMEOUT_ARM()/IFTIM_TIMEOUT_DISARM() macros (default: expand to
+** upstream's original plain register writes, so every other target is
+** byte-for-byte unaffected), which main.c now uses at every site that
+** used to write IFTIM's CR1/ARR/EGR/DIER directly. This backend
+** overrides them below so upstream's intended CR1/ARR values are never
+** actually applied to real TIM2 hardware at all -- see config.c's top
+** comment for the full design (at32_iftim_cr1_write()/
+** at32_iftim_reset(), and TIM7 as the independent 32.767ms timeout that
+** replaces IFTIM's own now-permanently-disabled ARR overflow).
 */
 
 #pragma once
@@ -103,7 +120,21 @@
 // NOTE: iftim_isr is intentionally NOT #define'd to any ISR name. It
 // keeps its real name and is called explicitly from TWO places in
 // config.c: dma1_channel1_isr() (every real ADC-ZC confirm) and
-// tim2_isr() (IFTIM's own UIF timeout). See config.c's top comment.
+// tim7_isr() (the independent 32.767ms timeout, via iftim_timeout() --
+// see below and config.c's top comment).
+
+// Portable IFTIM register-access abstraction overrides (src/defs.h has
+// the defaults; this file's top comment has the full rationale).
+// CR1/ARR are absorbed -- upstream's intended values never reach real
+// TIM2 hardware. EGR/OCR still reach it unchanged (genuine reset/
+// commutation-delay semantics are required). TIMEOUT_ARM/DISARM are
+// intentionally left at src/defs.h's default (still real TIM2 DIER
+// writes) for now.
+void at32_iftim_cr1_write(uint32_t v);
+void at32_iftim_reset(void);
+#define IFTIM_CR1_WRITE(v) at32_iftim_cr1_write(v)
+#define IFTIM_ARR_WRITE(v) ((void)(v))
+#define IFTIM_RESET() at32_iftim_reset()
 
 #define tim1_com_isr tim1_brk_up_trg_com_isr
 
@@ -143,12 +174,45 @@
 // reconfigures TIM3 (hardcoded in src/io.c, not via the IFTIM macro) --
 // which is now our 2us break-before-make scheduler, so this protection
 // still matters even though TIM3 is no longer IFTIM.
+// GENUINE HardFault found (motor off, no signal wired): config.c's
+// init() used to unconditionally nvic_enable_irq(NVIC_TIM15_IRQ)
+// before main() ever calls initio() (src/io.c) -- exactly the same
+// order AT32F421's own config.c uses too, so this ordering itself is
+// not inherently wrong. On this board a HardFault was nonetheless
+// captured (src/main.c's HARDFAULT_CAPTURE()) squarely inside TIM15's
+// handler (stacked xPSR IPSR=36 -> NVIC IRQ 20 = TIM15), branching to
+// PC=0 -- io.c's `iotim_isr(void) { ioirq(); }` calls a `static void
+// (*ioirq)(void)` that stays NULL until initio() runs
+// (`ioirq = entryirq;`), so any TIM15 interrupt that manages to fire
+// in the window between config.c's init() and main()'s initio() call
+// is a call through a NULL function pointer. IOTIM_NVIC_ENABLE()
+// (src/defs.h default: no-op) defers the real enable to initio()'s own
+// last statement instead, once ioirq is guaranteed non-NULL -- see
+// config.c (NVIC_TIM15_IRQ is no longer enabled in init()).
+#define IOTIM_NVIC_ENABLE() nvic_enable_irq(NVIC_TIM15_IRQ)
+
 #define IO_PA2
 #define IOTIM TIM15
 #define IOTIM_IDR (GPIOA_IDR & 0x4) // A2
 #define IOTIM_DMA 5
 #define iotim_isr tim15_isr
 #define iotim_dma_isr dma1_channel4_7_dma2_channel3_5_isr
+
+// HardFault diagnostics (src/defs.h's HARDFAULT_CAPTURE() default is a
+// no-op). LR at hard_fault_handler()'s entry holds EXC_RETURN -- the
+// instant ANY function is called (even a plain `bl`), LR is clobbered
+// with a return address instead, so SP/LR must be read INLINE, here,
+// before at32_hardfault_capture() (config.c) is called to do the rest
+// (SP itself is read post-hard_fault_handler's-own-prologue -- see
+// config.c's HARDFAULT_PROLOGUE_WORDS for how the original hardware-
+// stacked frame is located from that).
+extern volatile uint32_t at32_hardfault_sp, at32_hardfault_lr;
+void at32_hardfault_capture(void);
+#define HARDFAULT_CAPTURE() do { \
+	__asm__ volatile ("mov %0, sp" : "=r" (at32_hardfault_sp)); \
+	__asm__ volatile ("mov %0, lr" : "=r" (at32_hardfault_lr)); \
+	at32_hardfault_capture(); \
+} while (0)
 
 #define USART1_RX_DMA 3
 #define USART1_TX_DMA 2

@@ -103,6 +103,56 @@
 #define COMMUTATION_BREAK() ((void)0)
 #endif
 
+// Portable IFTIM register-access abstraction. Every place main.c
+// touches IFTIM's CR1/ARR or issues a timebase reset/timeout arm/disarm
+// goes through these instead of the raw TIM_xxx(IFTIM) macros, so a
+// backend whose IFTIM implementation has invariants a plain-16-bit-
+// auto-reload-timer assumption would violate (see mcu/AT32F425/config.h
+// -- IFTIM there is a 32-bit "Plus Mode" timer that must never actually
+// have its ARR changed or its Plus Mode bit cleared, even momentarily)
+// can absorb those writes before they ever reach real hardware, rather
+// than repairing them after the fact. Default: expands to exactly the
+// original plain register writes, so every other target is unaffected.
+#ifndef IFTIM_CR1_WRITE
+#define IFTIM_CR1_WRITE(v) (TIM_CR1(IFTIM) = (v))
+#endif
+#ifndef IFTIM_ARR_WRITE
+#define IFTIM_ARR_WRITE(v) (TIM_ARR(IFTIM) = (v))
+#endif
+#ifndef IFTIM_RESET
+#define IFTIM_RESET() (TIM_EGR(IFTIM) = TIM_EGR_UG)
+#endif
+#ifndef IFTIM_TIMEOUT_ARM
+#define IFTIM_TIMEOUT_ARM() (TIM_DIER(IFTIM) = TIM_DIER_UIE | IFTIM_ICIE)
+#endif
+#ifndef IFTIM_TIMEOUT_DISARM
+#define IFTIM_TIMEOUT_DISARM() (TIM_DIER(IFTIM) = 0)
+#endif
+
+// Portable hook, called as the very LAST statement of initio()
+// (src/io.c), after ioirq (io.c's static ISR-dispatch function
+// pointer) and all IOTIM/IOTIM2 registers are fully configured.
+// Default: no-op, since every existing target enables its IOTIM NVIC
+// line unconditionally in its own init() (before initio() runs) and
+// that is fine for them -- a backend overrides this only if it needs
+// to defer that enable until ioirq is actually non-NULL instead.
+#ifndef IOTIM_NVIC_ENABLE
+#define IOTIM_NVIC_ENABLE() ((void)0)
+#endif
+
+// Portable HardFault-diagnostic hook, called as the very FIRST
+// statement in hard_fault_handler() (src/main.c) -- before that point
+// only the compiler's own function-entry prologue has touched the
+// stack, so a backend override gets the earliest possible look at the
+// CPU state (SP/LR, and via SP the auto-stacked exception frame) that
+// caused a genuine CPU HardFault, as opposed to hard_fault_handler()'s
+// other two DELIBERATE call sites (invalid Hall code / unstable
+// signal), which aren't real faults and have no meaningful frame to
+// capture. Default: no-op.
+#ifndef HARDFAULT_CAPTURE
+#define HARDFAULT_CAPTURE() ((void)0)
+#endif
+
 #ifndef TEMP_SENS
 #define TEMP_SENS NTC10K3455UP2K
 #endif

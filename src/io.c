@@ -109,6 +109,7 @@ void initio(void) {
 	TIM_EGR(IOTIM2) = TIM_EGR_UG;
 	TIM_CR1(IOTIM2) = TIM_CR1_CEN;
 #endif
+	IOTIM_NVIC_ENABLE(); // See src/defs.h -- default no-op
 }
 
 static void entryirq(void) {
