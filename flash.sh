@@ -6,6 +6,7 @@
 #   ./flash.sh            build, then flash
 #   ./flash.sh -n         flash only (skip the build)
 #   ./flash.sh -c         connection check only (no build, no flash)
+#   ./flash.sh -a         app only (skip the bootloader)
 #   ./flash.sh -t NAME    use a different target (default: MOUSEG431)
 #
 # Environment overrides:
@@ -19,8 +20,16 @@ BUILD_DIR="$SRC_DIR/build"
 CFG="$SRC_DIR/openocd_stm32g431.cfg"
 
 TARGET=MOUSEG431
+# ESCape32 reserves the first 4K of flash for its own bootloader
+# (mcu/STM32G431/config.ld: boot=0x08000000+4K, cfg=+2K, app from
+# 0x08001800). Flashing only the app leaves 0x08000000 erased, so the
+# reset vector is 0xFFFFFFFF and the CPU locks up immediately -- with
+# the app itself verifying just fine, which makes it a confusing
+# failure. Both images are therefore flashed together by default.
+BOOT_TARGET=BOOT4_PA2
 DO_BUILD=1
 DO_FLASH=1
+DO_BOOT=1
 
 : "${OPENOCD:=/home/naoto/tools/openocd-install/bin/openocd}"
 : "${OPENOCD_SCRIPTS:=/home/naoto/tools/openocd-install/share/openocd/scripts}"
@@ -28,9 +37,10 @@ DO_FLASH=1
 while [ $# -gt 0 ]; do
 	case "$1" in
 		-n|--no-build) DO_BUILD=0 ;;
+		-a|--app-only) DO_BOOT=0 ;;
 		-c|--check) DO_BUILD=0; DO_FLASH=0 ;;
 		-t|--target) TARGET="$2"; shift ;;
-		-h|--help) sed -n '3,13p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+		-h|--help) sed -n '3,14p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
 		*) echo "unknown option: $1" >&2; exit 1 ;;
 	esac
 	shift
@@ -59,6 +69,10 @@ if [ "$DO_BUILD" = 1 ]; then
 	fi
 	echo "==> building $TARGET"
 	cmake --build "$BUILD_DIR" --target "$TARGET" -j"$(nproc)"
+	if [ "$DO_BOOT" = 1 ]; then
+		echo "==> building $BOOT_TARGET"
+		cmake --build "$BUILD_DIR" --target "$BOOT_TARGET" -j"$(nproc)"
+	fi
 fi
 
 # --- Locate the hex ---------------------------------------------------
@@ -70,6 +84,16 @@ shopt -u nullglob
 [ ${#hexes[@]} -gt 0 ] || die "no hex found for $TARGET in $BUILD_DIR (build first, or drop -n)"
 [ ${#hexes[@]} -eq 1 ] || die "multiple hex files for $TARGET: ${hexes[*]}"
 HEX="${hexes[0]}"
+
+BOOT_HEX=""
+if [ "$DO_BOOT" = 1 ]; then
+	shopt -s nullglob
+	boot_hexes=("$BUILD_DIR/boot/$BOOT_TARGET"-rev*.hex)
+	shopt -u nullglob
+	[ ${#boot_hexes[@]} -eq 1 ] ||
+		die "expected exactly one hex for $BOOT_TARGET in $BUILD_DIR/boot (found ${#boot_hexes[@]})"
+	BOOT_HEX="${boot_hexes[0]}"
+fi
 
 # --- Connection check -------------------------------------------------
 # The log is captured to a file rather than piped into grep: `grep -q`
@@ -92,8 +116,15 @@ if [ "$DO_FLASH" != 1 ]; then
 fi
 
 # --- Flash ------------------------------------------------------------
-echo "==> flashing $(basename "$HEX")"
-"$OPENOCD" -s "$OPENOCD_SCRIPTS" -f "$CFG" \
-	-c "program $HEX verify reset exit"
+if [ "$DO_BOOT" = 1 ]; then
+	echo "==> flashing $(basename "$BOOT_HEX") + $(basename "$HEX")"
+	"$OPENOCD" -s "$OPENOCD_SCRIPTS" -f "$CFG" \
+		-c "program $BOOT_HEX verify" \
+		-c "program $HEX verify reset exit"
+else
+	echo "==> flashing $(basename "$HEX") (app only)"
+	"$OPENOCD" -s "$OPENOCD_SCRIPTS" -f "$CFG" \
+		-c "program $HEX verify reset exit"
+fi
 
 echo "==> done"
