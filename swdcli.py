@@ -122,8 +122,19 @@ class OpenOCD:
         return buf[:-1].decode().strip()
 
     def read_bytes(self, addr: int, count: int) -> bytes:
-        words = self.cmd(f"read_memory {addr:#x} 8 {count}").split()
-        return bytes(int(w, 0) & 0xff for w in words)
+        """Word-sized reads whenever the block is aligned.
+
+        One AP transaction per byte dominates the snapshot rate -- 84 of them
+        is the difference between roughly 80 and several hundred samples a
+        second, which decides whether a trace can resolve individual
+        commutations at all.
+        """
+        if addr % 4 == 0:
+            words = self.cmd(
+                f"read_memory {addr:#x} 32 {(count + 3) // 4}").split()
+            return b"".join(int(w, 0).to_bytes(4, "little") for w in words)
+        byts = self.cmd(f"read_memory {addr:#x} 8 {count}").split()
+        return bytes(int(b, 0) & 0xff for b in byts)
 
     def read(self, addr: int, width: int = 32) -> int:
         return int(self.cmd(f"read_memory {addr:#x} {width} 1").split()[0], 0)
