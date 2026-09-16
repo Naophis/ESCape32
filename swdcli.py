@@ -31,6 +31,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -60,6 +61,68 @@ WANTED = {
     "ertm":    (4, True),    # electrical revolution time, us
     "throt":   (4, True),
 }
+
+
+# Comparator registers, and the three configurations compctl() installs --
+# copied verbatim from mcu/STM32G431/config.c, where they are commented
+# "A1>A0", "A1>A4" (both on COMP1) and "A3>A5" (COMP2).
+#
+# Note what that implies about the board: the virtual neutral has to reach
+# BOTH PA1 and PA3.  A star network on only one of them leaves a third of the
+# commutation steps comparing a phase against a floating pin, which is enough
+# to keep the ESC from ever holding sync.
+COMP1_CSR = 0x40010200
+COMP2_CSR = 0x40010204
+TIM2_TISEL = 0x4000005C   # 0x1 = TI1 from COMP1_OUT, 0x2 = from COMP2_OUT
+# Clearing MOE is the only way to actually float the phases: at rest the
+# firmware leaves every channel forced low with its complementary output
+# enabled, so all three windings sit shorted to ground.  src/main.c:577 sets
+# BDTR once at init and never touches it again, so borrowing it is safe as
+# long as it is put back.
+TIM1_BDTR = 0x40012C44
+TIM_BDTR_MOE = 1 << 15
+
+RCC_CSR = 0x40021094
+RESET_FLAGS = [(31, "LPWR"), (30, "WWDG"), (29, "IWDG"), (28, "SFT"),
+               (27, "BOR"), (26, "PIN"), (25, "OBL")]
+
+# Used by do_hsls() to drive one gate input at a time and read the phase back.
+TIM1_EGR = 0x40012C14
+TIM1_CCMR1 = 0x40012C18
+TIM1_CCMR2 = 0x40012C1C
+TIM1_CCER = 0x40012C20
+TIM_EGR_COMG = 1 << 5          # CCMR/CCER are preloaded (CR2.CCPC); COM applies them
+ADC1 = 0x50000000
+ADC2 = 0x50000100
+ADC_ISR, ADC_CR, ADC_CFGR, ADC_SQR1, ADC_DR = 0x00, 0x08, 0x0C, 0x30, 0x40
+ADC1_CFGR, ADC1_SQR1 = ADC1 + ADC_CFGR, ADC1 + ADC_SQR1
+ADC2_CFGR, ADC2_SQR1 = ADC2 + ADC_CFGR, ADC2 + ADC_SQR1
+# Every BEMF-side pin, with the ADC that can see it (STM32G431 datasheet
+# pin table): PA0/PA1/PA3 are ADC1 channels, PA4/PA5 are ADC2-only.
+BEMF_ADC = [
+    ("PA0", ADC1, 1),    # BEMF_A
+    ("PA4", ADC2, 17),   # BEMF_B
+    ("PA5", ADC2, 13),   # BEMF_C
+    ("PA1", ADC1, 2),    # BEMF_N (COMP1 reference)
+    ("PA3", ADC1, 4),    # BEMF_N (COMP2 reference)
+]
+ADC_CR_ADSTART = 1 << 2
+ADC_CR_ADSTP = 1 << 4
+ADC_CR_ADVREGEN = 1 << 28
+ADC_ISR_EOC = 1 << 2
+ADC_CFGR_CONT_OVRMOD = (1 << 13) | (1 << 12)   # free-run, DR always newest
+VREFINT_CAL_ADDR = 0x1FFF75AA                   # factory VREFINT at 3.0 V
+# DMA1 channel 4 feeds ADC1 in the firmware; adctrig() returns without
+# touching ADC1 while its EN bit is set (mcu/STM32G431/config.c adctrig()).
+DMA1_CCR4 = 0x40020044
+DMA1_CNDTR4 = 0x40020048
+DMA_CCR_EN = 1
+COMP_VALUE_BIT = 1 << 30  # COMPx_CSR VALUE, the comparator output
+COMP_CFG = [
+    ("phase A: PA0 vs neutral PA1", COMP1_CSR, 0x80071),
+    ("phase B: PA4 vs neutral PA1", COMP1_CSR, 0x80061),
+    ("phase C: PA5 vs neutral PA3", COMP2_CSR, 0x80161),
+]
 
 
 def load_symbols(elf: str) -> dict[str, tuple[int, int, bool]]:
@@ -93,23 +156,49 @@ class OpenOCD:
 
     def __init__(self, cfg: str, openocd: str, scripts: str, port: int = 6666):
         self.port = port
+        # OpenOCD logs everything to stderr.  Handing it a pipe nobody drains
+        # deadlocks it as soon as the pipe buffer fills -- it blocks on the
+        # write and stops answering the Tcl port -- so the log goes to a file
+        # we can still quote if startup fails.
+        self.log = tempfile.NamedTemporaryFile(
+            prefix="openocd-", suffix=".log", mode="w+", delete=False)
         self.proc = subprocess.Popen(
             [openocd, "-s", scripts, "-f", cfg],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            stdout=subprocess.DEVNULL, stderr=self.log, text=True)
         self.sock = None
         deadline = time.time() + 10
         while time.time() < deadline:
             if self.proc.poll() is not None:
-                raise RuntimeError("openocd exited:\n" + self.proc.stderr.read())
+                raise RuntimeError("openocd exited:\n" + self._log_tail())
             try:
                 self.sock = socket.create_connection(("127.0.0.1", port),
-                                                     timeout=2)
+                                                     timeout=5)
                 break
             except OSError:
                 time.sleep(0.1)
         if self.sock is None:
             self.close()
-            raise RuntimeError(f"openocd did not open its Tcl port {port}")
+            raise RuntimeError(f"openocd did not open its Tcl port {port}:\n"
+                               + self._log_tail())
+        # Halt the core at its reset vector on any self-reset, so RCC_CSR can
+        # be read before main() clears it (src/main.c:619).  That is the only
+        # way to tell a 3V3 brownout (BOR) from NRST noise (PIN) from the
+        # CLI's deliberate watchdog reset on UART noise at PA2 (WWDG,
+        # src/io.c cliirq()) -- and the board has already reset itself once
+        # the instant throttle was applied.
+        self.cmd("cortex_m vector_catch reset")
+
+    def state(self) -> str:
+        """'running', 'halted', 'reset' or 'unknown', from `targets`."""
+        return self.cmd("targets").splitlines()[-1].split()[-1]
+
+    def _log_tail(self, lines: int = 20) -> str:
+        try:
+            self.log.flush()
+            with open(self.log.name) as f:
+                return "".join(f.readlines()[-lines:])
+        except OSError:
+            return "(log unavailable)"
 
     def cmd(self, line: str) -> str:
         self.sock.sendall(line.encode() + b"\x1a")
@@ -130,22 +219,42 @@ class OpenOCD:
         commutations at all.
         """
         if addr % 4 == 0:
-            words = self.cmd(
-                f"read_memory {addr:#x} 32 {(count + 3) // 4}").split()
-            return b"".join(int(w, 0).to_bytes(4, "little") for w in words)
-        byts = self.cmd(f"read_memory {addr:#x} 8 {count}").split()
-        return bytes(int(b, 0) & 0xff for b in byts)
+            words = self._nums(
+                self.cmd(f"read_memory {addr:#x} 32 {(count + 3) // 4}"),
+                f"read {addr:#x}")
+            return b"".join(w.to_bytes(4, "little") for w in words)
+        byts = self._nums(self.cmd(f"read_memory {addr:#x} 8 {count}"),
+                          f"read {addr:#x}")
+        return bytes(b & 0xff for b in byts)
+
+    @staticmethod
+    def _nums(reply: str, what: str) -> list[int]:
+        """OpenOCD answers a failed access with prose rather than numbers --
+        "Failed to read memory at 0x..." when the target has reset or dropped
+        off SWD -- and int() turning that into a bare ValueError hid exactly
+        the event we most needed to see.  Surface the message instead."""
+        try:
+            return [int(w, 0) for w in reply.split()]
+        except ValueError:
+            raise RuntimeError(f"{what}: openocd said {reply!r}") from None
 
     def read(self, addr: int, width: int = 32) -> int:
-        return int(self.cmd(f"read_memory {addr:#x} {width} 1").split()[0], 0)
+        return self._nums(self.cmd(f"read_memory {addr:#x} {width} 1"),
+                          f"read {addr:#x}")[0]
 
     def write(self, addr: int, value: int, width: int = 32) -> None:
         masked = value & ((1 << width) - 1)
-        self.cmd(f"write_memory {addr:#x} {width} {{{masked}}}")
+        reply = self.cmd(f"write_memory {addr:#x} {width} {{{masked}}}")
+        # A successful write_memory answers with nothing at all.  Anything
+        # else is an error, and a silently failed `throt 0` is the one
+        # failure this tool must never swallow.
+        if reply:
+            raise RuntimeError(f"write {addr:#x}: openocd said {reply!r}")
 
     def close(self) -> None:
         if self.sock:
             try:
+                self.cmd("cortex_m vector_catch none")
                 self.cmd("shutdown")
             except Exception:
                 pass
@@ -154,6 +263,19 @@ class OpenOCD:
             self.proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             self.proc.kill()
+        # Keep the log whenever OpenOCD complained -- it is the only record
+        # of what the probe saw when the target went away.
+        try:
+            self.log.close()
+            with open(self.log.name) as f:
+                text = f.read()
+            if "Error" in text or "Warn" in text:
+                tail = "".join(text.splitlines(True)[-8:])
+                print(f"openocd log kept at {self.log.name}:\n{tail}", end="")
+            else:
+                os.unlink(self.log.name)
+        except OSError:
+            pass
 
     def __enter__(self):
         return self
@@ -168,6 +290,14 @@ class Escape32:
         self.syms = syms
         self.base = min(a for a, _, _ in syms.values())
         self.span = max(a + s for a, s, _ in syms.values()) - self.base
+        # `tick` counts up at 16 kHz from boot and never otherwise goes
+        # backwards, so a snapshot in which it has shrunk means the firmware
+        # rebooted underneath us.  A power-class (BOR) reset does exactly
+        # that without tripping the vector catch, and it leaves the ESC in
+        # the arming loop waiting for a zero throttle that a plain `throt N`
+        # would never supply.
+        self.last_tick: int | None = None
+        self.rebooted = False
 
     def get(self, name: str) -> int:
         addr, size, signed = self.syms[name]
@@ -191,6 +321,9 @@ class Escape32:
             off = addr - self.base
             out[name] = int.from_bytes(blob[off:off + size], "little",
                                        signed=signed)
+        if self.last_tick is not None and out["tick"] < self.last_tick:
+            self.rebooted = True
+        self.last_tick = out["tick"]
         return out
 
     def arm(self) -> None:
@@ -206,6 +339,40 @@ class Escape32:
         # we just set (src/prog.c:255).
         self.put("analog", 0)
         self.put("throt", value)
+
+    def reset_cause(self) -> str:
+        """Decode RCC_CSR on a core halted at its reset vector."""
+        csr = self.ocd.read(RCC_CSR)
+        names = [n for b, n in RESET_FLAGS if csr >> b & 1]
+        return f"RCC_CSR={csr:#010x} ({', '.join(names) or 'no flags set'})"
+
+    def check_reset(self, since: float | None = None) -> bool:
+        """Notice either kind of self-reset and get the firmware going again.
+
+        A system reset (NRST, watchdog, SYSRESETREQ) trips the vector catch
+        and leaves the core halted at the vector with RCC_CSR intact.  A
+        power-class reset (BOR/POR) resets the debug logic too, so the
+        firmware simply reboots; the only trace is `tick` starting over.
+        Either way the ESC ends up in its arming loop, and only a zero
+        throttle gets it out.  Returns True if a reset was found.
+        """
+        when = "" if since is None else f" {time.time() - since:.3f}s after throttle-on"
+        if self.ocd.state() == "halted":
+            print(f"  TARGET RESET ITSELF{when}: {self.reset_cause()}")
+            self.ocd.cmd("resume")   # boots from reset; .bss init zeroes throt
+            time.sleep(0.5)
+        else:
+            self.snapshot()          # refreshes self.rebooted
+            if not self.rebooted:
+                return False
+            print(f"  FIRMWARE REBOOTED{when}: power-class reset (BOR/POR) -- "
+                  "the debug port was\n  lost with it, so the cause flags "
+                  "were already cleared by boot.")
+        self.rebooted = False
+        self.last_tick = None
+        self.arm()
+        print("  re-armed; throttle is now 0 -- send it again")
+        return True
 
     def safe_stop(self) -> None:
         try:
@@ -257,10 +424,27 @@ def do_trace(esc: Escape32, throt: int, secs: float) -> None:
     t0 = time.time()
     try:
         esc.set_throt(throt)
+        n = 0
         while time.time() - t0 < secs:
             samples.append((time.time() - t0, esc.snapshot()))
+            n += 1
+            # After a self-reset the core sits halted (vector catch) and reads
+            # keep succeeding against frozen RAM, so the halt must be polled
+            # for; every 50th sample keeps that to a few RPCs a second.
+            if n % 50 == 0 and esc.check_reset(t0):
+                break
     except KeyboardInterrupt:
         pass
+    except RuntimeError as e:
+        # Reads fail for a few ms while the reset is in progress; by the time
+        # we get here the core is usually already halted at the vector.
+        print(f"  ABORTED at {time.time() - t0:.3f}s after "
+              f"{len(samples)} samples: {e}")
+        time.sleep(0.1)
+        try:
+            esc.check_reset(t0)
+        except RuntimeError as e2:
+            print(f"  (and still unreachable: {e2})")
     finally:
         esc.safe_stop()
 
@@ -300,7 +484,13 @@ def do_trace(esc: Escape32, throt: int, secs: float) -> None:
     if ivals:
         print(f"  ival: {min(ivals)}..{max(ivals)}")
     print()
-    if max(syncs) < 6:
+    if not any(s["step"] for _, s in samples):
+        # step stays 0 until main() actually starts the motor, so without
+        # this the "never synced" verdict below would fire on every idle run.
+        print("  step stayed 0: the motor never started, so there is nothing "
+              "to conclude about\n  sync here.  Re-run with a non-zero "
+              "throttle.")
+    elif max(syncs) < 6:
         print("  sync never reached 6: the ESC never locked onto BEMF, so "
               "commutation ran\n  open loop off the interval timeout.  An "
               "unrepeatable shaft direction is expected\n  in that state -- "
@@ -311,6 +501,508 @@ def do_trace(esc: Escape32, throt: int, secs: float) -> None:
               "but not reliably.")
     else:
         print("  sync held at 6: the ESC ran closed-loop on BEMF for this run.")
+
+
+def do_bemf(esc: Escape32, secs: float = 5.0) -> None:
+    """Check the BEMF front end with the motor unpowered, by hand.
+
+    While the motor is stopped the firmware leaves both comparators cleared
+    (compctl(0)), so we can borrow them: configure one exactly the way
+    compctl() would for a given step, then watch COMPx_CSR VALUE while the
+    shaft is turned by hand.  Spinning a motor by hand generates real BEMF,
+    so a phase that is wired and divided correctly makes the output toggle
+    several times per revolution.  A phase that never toggles is not reaching
+    the comparator -- or its neutral reference is not.
+
+    The bridge has to be opened first.  While the motor is stopped ESCape32
+    leaves all three phases clamped to ground (OCxM force-low with CCxNE set
+    and MOE still on), which both shorts the windings -- so turning the shaft
+    produces almost no BEMF -- and parks every comparator input right on its
+    threshold, where it chatters.  Measured on this board that was 403 false
+    transitions per second with the shaft held still.  So MOE is cleared for
+    the duration and restored afterwards.
+
+    Each phase is sampled twice: once with the shaft still, to establish a
+    baseline, and once while it is turned.  Only the comparison between the
+    two means anything.
+
+    The metric is the longest run of identical samples, not the number of
+    transitions.  With the bridge open and the shaft still, a floating phase
+    sits on the comparator threshold and free-runs on noise -- measured on
+    this board at roughly 370 transitions a second on every phase, wired or
+    not -- so edge counting cannot tell a connected phase from a dead one.
+    Real BEMF is slow by comparison: at a few revolutions a second the output
+    holds one level for hundreds of consecutive samples.  That is what
+    separates them.
+
+    This drives nothing, so it is safe to run with the motor supply on.
+    """
+    st = esc.snapshot()
+    if st["step"] or st["throt"]:
+        print("motor is still running -- 'stop' first")
+        return
+
+    def profile(reg: int, secs: float) -> tuple[int, float, int]:
+        """Return (samples, fraction high, longest run of one level)."""
+        end = time.time() + secs
+        runs, prev, run, high = [], None, 0, 0
+        while time.time() < end:
+            v = bool(esc.ocd.read(reg) & COMP_VALUE_BIT)
+            high += v
+            if v == prev:
+                run += 1
+            else:
+                if prev is not None:
+                    runs.append(run)
+                run, prev = 1, v
+        runs.append(run)
+        n = sum(runs)
+        return n, high / max(n, 1), max(runs)
+
+    bdtr = esc.ocd.read(TIM1_BDTR)
+    results = []
+    try:
+        esc.ocd.write(TIM1_BDTR, bdtr & ~TIM_BDTR_MOE)  # float all phases
+        print(f"bridge opened (BDTR {bdtr:#x} -> {bdtr & ~TIM_BDTR_MOE:#x})")
+        for name, reg, cfg in COMP_CFG:
+            esc.ocd.write(COMP1_CSR, cfg if reg == COMP1_CSR else 0)
+            esc.ocd.write(COMP2_CSR, cfg if reg == COMP2_CSR else 0)
+            print(f"\n  {name}")
+            print("    hold the shaft still ...", end="", flush=True)
+            time.sleep(0.5)
+            n1, hi1, idle = profile(reg, 1.0)
+            print(f" baseline: longest run {idle} of {n1} samples, "
+                  f"{hi1 * 100:.0f}% high")
+            try:
+                input(f"    now turn the shaft by hand for {secs}s, "
+                      "then press Enter to start ...")
+            except EOFError:
+                print("    (no terminal -- skipping the spin half)")
+                results.append((name, idle, None))
+                continue
+            n2, hi2, spun = profile(reg, secs)
+            print(f"    turning:  longest run {spun} of {n2} samples, "
+                  f"{hi2 * 100:.0f}% high")
+            results.append((name, idle, spun))
+    except KeyboardInterrupt:
+        print()
+    finally:
+        esc.ocd.write(COMP1_CSR, 0)  # as compctl(0) leaves them
+        esc.ocd.write(COMP2_CSR, 0)
+        esc.ocd.write(TIM1_BDTR, bdtr)
+        print(f"\nbridge restored (BDTR {bdtr:#x})")
+
+    scored = [(n, i, s) for n, i, s in results if s is not None]
+    if not scored:
+        return
+    print()
+    # A wired phase holds a level for hundreds of samples once BEMF appears;
+    # noise chatter never manages more than a handful.
+    dead = [n for n, i, s in scored if s < max(3 * i, 20)]
+    if not dead:
+        print("  every phase holds a level far longer while turning than at "
+              "rest: the BEMF\n  dividers and both neutral pins are wired.")
+    elif len(dead) == len(scored):
+        # Hand speed on a high-Kv motor gives tens of millivolts of BEMF
+        # before the divider, which is below the comparator's own offset --
+        # so an all-dead result is an inconclusive test, not a broken board.
+        # Note that all three phases sharing one signature (same %high, same
+        # run lengths) is itself informative: a genuinely floating neutral
+        # pin would rail its comparator rather than chatter like the others.
+        print("  no phase responded to turning.  With a small high-Kv motor "
+              "that is the\n  expected outcome -- hand speed produces less "
+              "BEMF than the comparator can\n  resolve through the divider -- "
+              "so this run proves nothing either way.\n  Use `trace` with "
+              "the motor actually driven; BEMF there is 10-100x larger.")
+    else:
+        print("  no response on: " + ", ".join(dead))
+        if any("PA3" in n for n in dead) and not any("PA1" in n for n in dead):
+            print("  Only the PA3-referenced phase is dead, which points "
+                  "straight at the virtual\n  neutral: PA3 needs the same "
+                  "star network as PA1, not just PA1 alone.")
+        else:
+            print("  Check those phases' dividers and the star network "
+                  "feeding PA1/PA3.")
+
+
+def do_hsls(esc: Escape32) -> None:
+    """Find out on real hardware which driver input pin is the high side.
+
+    The schematic wires TIM1_CH1 (net HSA) to driver pin 6 and TIM1_CH1N
+    (net LSA) to pin 3, drawn with an MP6540H symbol whose pin names are
+    PWMA/ENA.  The part fitted is the MP6540HA, on which pins 3-8 are the
+    separate HS/LS inputs instead -- so whether pin 6 is the high side or
+    the low side decides whether every commutation step drives the motor
+    with the intended polarity or the opposite one.  Reversed polarity still
+    spins the motor, but against the zero-crossing pattern the ESC expects,
+    so sync never holds and the shaft direction wanders.
+
+    Rather than trust any pin table, drive one gate input at a time and read
+    the phase voltage back through the BEMF divider on PA0 with ADC1_IN1.
+    With a single MOSFET on there is no current path -- the phase either
+    rises to VIN (high side) or sits at ground (low side) -- so this is safe
+    with the motor supply on.  The CPU is halted for the duration so the
+    firmware cannot touch TIM1 or the ADC mid-test, and everything is put
+    back before it resumes.
+    """
+    st = esc.snapshot()
+    if st["step"] or st["throt"]:
+        print("motor is still running -- 'stop' first")
+        return
+    ocd = esc.ocd
+    ocd.cmd("halt")
+    saved = {r: ocd.read(r) for r in
+             (TIM1_CCMR1, TIM1_CCMR2, TIM1_CCER,
+              ADC1_CFGR, ADC1_SQR1, ADC2_CFGR, ADC2_SQR1)}
+    started = {b: ocd.read(b + ADC_CR) & ADC_CR_ADSTART for b in (ADC1, ADC2)}
+
+    def outputs(ccmr1: int, ccer: int) -> None:
+        ocd.write(TIM1_CCMR1, ccmr1)
+        ocd.write(TIM1_CCMR2, 0x40)          # OC3M force-low
+        ocd.write(TIM1_CCER, ccer)
+        ocd.write(TIM1_EGR, TIM_EGR_COMG)
+        time.sleep(0.05)
+
+    def adc(base: int, chan: int) -> int:
+        """One software-triggered conversion of `chan` on the ADC at `base`."""
+        # ADSTART stays set while the ADC waits on TIM1_TRGO, and SQR/CFGR
+        # may only be changed once it is clear.
+        if ocd.read(base + ADC_CR) & ADC_CR_ADSTART:
+            ocd.write(base + ADC_CR, ADC_CR_ADVREGEN | ADC_CR_ADSTP)
+            for _ in range(100):
+                if not ocd.read(base + ADC_CR) & ADC_CR_ADSTART:
+                    break
+        ocd.write(base + ADC_CFGR, 0)        # software trigger, no DMA
+        ocd.write(base + ADC_SQR1, chan << 6)
+        ocd.write(base + ADC_ISR, 0x1E)      # clear EOSMP/EOC/EOS/OVR
+        ocd.write(base + ADC_CR, ADC_CR_ADVREGEN | ADC_CR_ADSTART)
+        for _ in range(100):
+            if ocd.read(base + ADC_ISR) & ADC_ISR_EOC:
+                break
+        return ocd.read(base + ADC_DR) & 0xFFF
+
+    def bemf_pins() -> dict[str, int]:
+        return {name: adc(base, chan) for name, base, chan in BEMF_ADC}
+
+    try:
+        print("CPU halted; driving one gate input at a time, reading the BEMF pins")
+        # OC1M force-high = 0x50, force-low = 0x40; OC2M force-low = 0x4000.
+        # CCER 0x444 = CC1NE|CC2NE|CC3NE (the firmware's idle set),
+        #      0x441 = CC1E |CC2NE|CC3NE.
+        outputs(0x4040, 0x444)
+        base = bemf_pins()                   # everything low
+        outputs(0x4050, 0x441)
+        pin6 = bemf_pins()                   # CH1 high; CH1N driven low
+        outputs(0x4040, 0x444)
+        outputs(0x4050, 0x444)
+        pin3 = bemf_pins()                   # CH1N = OC1REF = high; CH1 low
+        outputs(0x4040, 0x444)
+    finally:
+        for r, v in saved.items():
+            ocd.write(r, v)
+        ocd.write(TIM1_EGR, TIM_EGR_COMG)
+        for b, was in started.items():       # back onto TIM1_TRGO
+            if was:
+                ocd.write(b + ADC_CR, ADC_CR_ADVREGEN | ADC_CR_ADSTART)
+        ocd.cmd("resume")
+        print("registers restored, CPU resumed")
+
+    def mv(c: int) -> int:
+        return c * 3300 // 4095
+
+    names = [n for n, _, _ in BEMF_ADC]
+    print("                       " + "".join(f"{n:>12}" for n in names))
+    for label, row in (("all inputs low", base), ("pin 6 (CH1)  high", pin6),
+                       ("pin 3 (CH1N) high", pin3)):
+        print(f"  {label:20s} " + "".join(f"{mv(row[n]):8d} mV" for n in names))
+    # With one high side on and nothing else conducting, the other two
+    # phases float up to the same rail through the windings, so all three
+    # dividers and both neutral pins should read alike.  One that does not
+    # is a divider or a trace, not the firmware.
+    hi = pin6
+    ref = max(hi.values())
+    odd = [n for n in names if ref > 1000 and hi[n] < ref // 2]
+    if odd:
+        print(f"  with pin 6 high, these pins did not follow the rail: "
+              f"{', '.join(odd)}  <-- check that divider / neutral wiring")
+    pin6, pin3, base = pin6["PA0"], pin3["PA0"], base["PA0"]
+    # 12V VIN through the 56k/10k divider lands near 1.8V, about 2250 counts.
+    high = 1000
+    print()
+    if pin6 > high and pin3 < high:
+        print("  pin 6 is the HIGH side and pin 3 the LOW side: the wiring "
+              "matches the build\n  (CH1 -> HS, CH1N -> LS).  Polarity is not "
+              "the problem; look at zero-crossing.")
+    elif pin3 > high and pin6 < high:
+        print("  pin 3 is the HIGH side and pin 6 the LOW side: HS and LS are "
+              "SWAPPED relative\n  to the build.  Every step drives the "
+              "windings with reversed polarity.")
+    elif pin6 < high and pin3 < high:
+        print("  neither input raised the phase.  Is the motor supply on?  "
+              "(If TIM1 was frozen\n  by the debugger, the forced outputs "
+              "may not have applied -- retry once.)")
+    else:
+        print("  both inputs raised the phase -- unexpected; only one input "
+              "was driven at a time.")
+
+
+def do_power(esc: Escape32, throt: int, secs: float) -> None:
+    """Spin as `trace` does, but watch the supply rails while doing it.
+
+    Two runs have already ended with the debug port itself dropping off SWD
+    and the reset vector catch not holding -- the signature of a power-class
+    (BOR) reset, which is the one kind the catch cannot survive.  This
+    measures instead of infers: VDDA through VREFINT on ADC1, and VIN
+    through the phase-B divider on ADC2, both free-running in continuous
+    mode and read from their DR next to every state snapshot.
+
+    Borrowing ADC1 is safe here.  adctrig() gives up whenever DMA channel 4
+    is still enabled, so leaving that armed keeps the firmware's hands off
+    the ADC for the duration, and nothing control-critical consumes its
+    samples on this build (no SENS_MAP, PROT_TEMP=0).  ADC2 is idle on this
+    build (len2 = 0).  Everything is put back with a clean reboot at the end
+    rather than trusting a partial restore.
+    """
+    st = esc.snapshot()
+    if st["step"] or st["throt"]:
+        print("motor is still running -- 'stop' first")
+        return
+    ocd = esc.ocd
+    vcal = ocd.read(VREFINT_CAL_ADDR, 16)
+    # Take the ADCs while the firmware is stopped, so adctrig() cannot
+    # restart ADC1 underneath the reconfiguration.
+    ocd.cmd("halt")
+    try:
+        ocd.write(DMA1_CNDTR4, 1)
+        ocd.write(DMA1_CCR4, DMA_CCR_EN)     # parks adctrig() for the duration
+        for base, chan in ((ADC1, 18), (ADC2, 17)):
+            if ocd.read(base + ADC_CR) & ADC_CR_ADSTART:
+                ocd.write(base + ADC_CR, ADC_CR_ADVREGEN | ADC_CR_ADSTP)
+                for _ in range(100):
+                    if not ocd.read(base + ADC_CR) & ADC_CR_ADSTART:
+                        break
+            ocd.write(base + ADC_CFGR, ADC_CFGR_CONT_OVRMOD)
+            ocd.write(base + ADC_SQR1, chan << 6)
+            ocd.write(base + ADC_ISR, 0x1E)
+            ocd.write(base + ADC_CR, ADC_CR_ADVREGEN | ADC_CR_ADSTART)
+    finally:
+        ocd.cmd("resume")
+    time.sleep(0.05)
+
+    def rails() -> tuple[float, float]:
+        vref = ocd.read(ADC1 + ADC_DR) & 0xFFF
+        pb = ocd.read(ADC2 + ADC_DR) & 0xFFF
+        vdda = 3.0 * vcal / vref if vref else 0.0
+        return vdda, pb * vdda / 4095 * 6.6   # 56k/10k divider on the phase
+
+    idle = [rails() for _ in range(20)]
+    print(f"idle : VDDA {min(v for v, _ in idle):.3f}..{max(v for v, _ in idle):.3f} V"
+          f"   VIN(phase B, floating) {max(x for _, x in idle):.2f} V")
+    print(f"power: throt {throt} for {secs}s  (Ctrl-C cuts throttle)")
+    rows: list[tuple[float, float, float, int, int]] = []
+    t0 = time.time()
+    note = None
+    try:
+        esc.set_throt(throt)
+        n = 0
+        while time.time() - t0 < secs:
+            s = esc.snapshot()
+            v, x = rails()
+            rows.append((time.time() - t0, v, x, s["step"], s["sync"]))
+            n += 1
+            if n % 50 == 0 and ocd.state() == "halted":
+                note = (f"core halted at reset vector {time.time() - t0:.3f}s "
+                        f"after throttle-on: {esc.reset_cause()}")
+                break
+    except KeyboardInterrupt:
+        pass
+    except RuntimeError as e:
+        note = f"target dropped off SWD {time.time() - t0:.3f}s after throttle-on: {e}"
+    finally:
+        try:
+            esc.set_throt(0)
+        except Exception:
+            pass
+        # A reboot puts ADC1/ADC2/DMA back exactly as init() wants them; the
+        # vector catch then holds the core at the vector, hence the resume.
+        try:
+            ocd.cmd("reset halt")
+            ocd.cmd("resume")
+            time.sleep(0.5)
+            esc.arm()
+            print("firmware rebooted and re-armed")
+        except RuntimeError as e:
+            print(f"could not reboot/re-arm: {e}")
+
+    if note:
+        print("  " + note)
+    if not rows:
+        print("no samples")
+        return
+    print(f"  {len(rows)} samples in {rows[-1][0]:.2f}s")
+    print("   t(ms)   VDDA min / mean     VIN min / max    steps  sync")
+    bins: dict[int, list] = {}
+    for r in rows:
+        bins.setdefault(int(r[0] * 10), []).append(r)
+    for b in sorted(bins):
+        rs = bins[b]
+        steps = sum(1 for a, c in zip(rs, rs[1:]) if c[3] != a[3])
+        print(f"  {b * 100:5d}    {min(r[1] for r in rs):.3f} / {sum(r[1] for r in rs) / len(rs):.3f} V"
+              f"    {min(r[2] for r in rs):5.2f} / {max(r[2] for r in rs):5.2f} V"
+              f"    {steps:3d}   {max(r[4] for r in rs)}")
+    print("  last samples before the end:")
+    for t, v, x, stp, sy in rows[-8:]:
+        print(f"    {t * 1000:7.1f} ms  VDDA {v:.3f} V  VIN {x:5.2f} V  step {stp}  sync {sy}")
+    lo = min(r[1] for r in rows)
+    print(f"  VDDA floor during run: {lo:.3f} V"
+          + ("   <-- sagging" if lo < 3.0 else ""))
+
+
+def do_zc(esc: Escape32, throt: int, secs: float) -> None:
+    """Spin, and per commutation step check whether the ACTIVE comparator's
+    output actually crosses.
+
+    The trace shows sync climbing then collapsing at one fixed step, every
+    revolution -- the signature of a single BEMF phase whose zero-crossing is
+    never seen, so that step always waits out the full timeout.  This finds
+    which one, without guessing: read the live COMPx_CSR while spinning.  A
+    healthy step's active comparator toggles its VALUE bit (bit 30) within
+    the step (a real crossing); the failing step's stays stuck at one level.
+
+    compctl() drives only one comparator at a time (the other CSR is 0), so
+    "active" = whichever CSR has its EN bit set.  Its config value also tells
+    us the polarity bit (0x8000), which is the thing that differs between the
+    working and failing use of the same comparator.
+    """
+    st = esc.snapshot()
+    if st["step"] or st["throt"]:
+        print("motor is still running -- 'stop' first")
+        return
+    ocd = esc.ocd
+    step_addr = esc.syms["step"][0]
+    # per step, keyed by the input-select signature of the comparator the
+    # timer is actually capturing (TIM2_TISEL picks COMP1 vs COMP2; the CSR
+    # config's low bits pick which pin within COMP1).  compctl() leaves the
+    # other CSR enabled, so TISEL -- not CSR.EN -- is the authority.
+    SIG = {0x071: "COMP1 PA0>PA1 (phaseA)",
+           0x061: "COMP1 PA4>PA1 (phaseB)",
+           0x161: "COMP2 PA5>PA3 (phaseC)"}
+    acc: dict[int, dict] = {s: {} for s in range(1, 7)}
+    t0 = time.time()
+    rebooted = False
+    try:
+        esc.set_throt(throt)
+        n = 0
+        while time.time() - t0 < secs:
+            step = ocd.read(step_addr)
+            tisel = ocd.read(TIM2_TISEL) & 0xF
+            csr = ocd.read(COMP1_CSR if tisel == 1 else COMP2_CSR)
+            if step in acc and tisel in (1, 2):
+                sig = csr & 0x1FF
+                d = acc[step].setdefault(
+                    sig, {"pol": csr & 0x8000, "lo": 0, "hi": 0, "n": 0})
+                d["n"] += 1
+                if csr & (1 << 30):
+                    d["hi"] += 1
+                else:
+                    d["lo"] += 1
+            n += 1
+            if n % 60 == 0 and ocd.state() == "halted":
+                rebooted = True
+                break
+    except KeyboardInterrupt:
+        pass
+    except RuntimeError:
+        rebooted = True
+    finally:
+        esc.safe_stop()
+    if rebooted:
+        esc.check_reset(t0)
+
+    print(f"\n  per-step comparator activity at throt {throt}:")
+    print("  step  comparator (TISEL-selected)   pol    output          verdict")
+    for s in range(1, 7):
+        if not acc[s]:
+            print(f"   {s}    (never observed)")
+            continue
+        sig = max(acc[s], key=lambda k: acc[s][k]["n"])
+        d = acc[s][sig]
+        cname = SIG.get(sig, f"?sig={sig:#05x}")
+        pol = "flip" if d["pol"] else "norm"
+        toggled = d["lo"] and d["hi"]
+        bal = f"{d['lo']}lo/{d['hi']}hi"
+        verdict = "crosses (ok)" if toggled else (
+            "STUCK HIGH -- no ZC" if d["hi"] else "STUCK LOW -- no ZC")
+        print(f"   {s}    {cname:26s} {pol}   {bal:14s}  {verdict}")
+    print("\n  A step whose active comparator is STUCK is the one that stalls "
+          "commutation.\n  Compare it with the same comparator's other step: "
+          "if only one polarity is\n  stuck, the crossing is real but lands "
+          "outside the detectable window (offset\n  or blanking); if the "
+          "comparator is stuck in both its steps, that phase's\n  divider or "
+          "neutral reference is the suspect.")
+
+
+CFG_SINE_RANGE = 0x20000019   # cfg.sine_range, 1 byte (cfg base 0x20000000)
+CFG_SINE_POWER = 0x2000001A   # cfg.sine_power, 1 byte
+
+
+def do_sine(esc: Escape32, throt: int, power: int, secs: float) -> None:
+    """Run ESCape32's open-loop sine startup and hold it, without a rebuild.
+
+    sine_range / sine_power are runtime cfg fields, so they can be set in RAM
+    and take effect on the next throttle command.  Measured on this board,
+    sine startup spins the motor up smoothly with no BEMF lock at all (it is
+    open loop) -- useful both as a working "it just turns" mode and as the
+    ramp that hands over to 6-step once the throttle exceeds sine_range*20.
+
+    This keeps the throttle *below* that handover point (sine_range is set
+    high enough that `throt` stays inside it), so it exercises sine alone.
+    cfg is restored on exit; a reset would restore it anyway since these are
+    only RAM copies of the saved config.
+    """
+    st = esc.snapshot()
+    if st["step"] or st["throt"]:
+        print("motor is still running -- 'stop' first")
+        return
+    ocd = esc.ocd
+    # Keep throt strictly inside the sine window: range = sine_range*20 must
+    # exceed throt by more than delta(=10), so sine never hands over.
+    sine_range = min((throt + 40) // 20, 25)
+    save = (ocd.read(CFG_SINE_RANGE, 8), ocd.read(CFG_SINE_POWER, 8))
+    print(f"sine: throt {throt}, sine_power {power}, sine_range {sine_range} "
+          f"(range {sine_range * 20} > throt, so pure sine)  Ctrl-C cuts throttle")
+    rows = []
+    t0 = time.time()
+    reb = False
+    try:
+        ocd.write(CFG_SINE_RANGE, sine_range, 8)
+        ocd.write(CFG_SINE_POWER, max(1, min(power, 15)), 8)
+        esc.set_throt(throt)
+        n = 0
+        while time.time() - t0 < secs:
+            s = esc.snapshot()
+            rows.append((s["sine"], s["step"], s["ertm"]))
+            n += 1
+            if n % 50 == 0 and ocd.state() == "halted":
+                reb = True
+                break
+    except KeyboardInterrupt:
+        pass
+    except RuntimeError:
+        reb = True
+    finally:
+        esc.safe_stop()
+        ocd.write(CFG_SINE_RANGE, save[0], 8)
+        ocd.write(CFG_SINE_POWER, save[1], 8)
+        print(f"throttle cut, cfg restored (sine_range={save[0]}, "
+              f"sine_power={save[1]})")
+    if reb:
+        esc.check_reset(t0)
+    if rows:
+        insine = sum(1 for r in rows if r[0]) * 100 // len(rows)
+        erpms = [60000000 // r[2] for r in rows if 0 < r[2] < 100000000]
+        print(f"  {len(rows)} samples | in sine mode {insine}% of the time"
+              + (f" | ERPM {min(erpms)}..{max(erpms)}" if erpms else ""))
 
 
 def do_ramp(esc: Escape32, stop: int, step: int, dwell: float) -> None:
@@ -338,7 +1030,11 @@ def do_ramp(esc: Escape32, stop: int, step: int, dwell: float) -> None:
 
 def do_repl(esc: Escape32) -> None:
     print("commands:  throt <-2000..2000> | stop | status | watch [sec]")
-    print("           trace <throt> [sec] | ramp <max> [step] [dwell]")
+    print("           trace <throt> [sec]        commutation/sync trace")
+    print("           zc <throt> [sec]           per-step comparator ZC check")
+    print("           sine <throt> [pow] [sec]   open-loop sine startup")
+    print("           ramp <max> [step] [dwell]  step throttle up")
+    print("           bemf [sec] | hsls | power <throt> [sec]")
     print("           reset | quit")
     while True:
         try:
@@ -351,11 +1047,18 @@ def do_repl(esc: Escape32) -> None:
         parts = line.split()
         verb, args = parts[0], parts[1:]
         try:
+            # A reset between commands would otherwise go unnoticed until a
+            # write silently landed on a halted core.
+            esc.check_reset()
             if verb in ("quit", "exit", "q"):
                 return
             elif verb == "throt":
                 esc.set_throt(args[0])
-                print(fmt_status(esc.snapshot()))
+                # A reboot in the first moments after throttle-on is the
+                # failure this board actually has; give it a chance to show.
+                time.sleep(0.3)
+                if not esc.check_reset():
+                    print(fmt_status(esc.snapshot()))
             elif verb == "stop":
                 esc.set_throt(0)
                 print("throttle cut")
@@ -366,6 +1069,8 @@ def do_repl(esc: Escape32) -> None:
                 end = time.time() + secs
                 try:
                     while time.time() < end:
+                        if esc.check_reset():
+                            break
                         print(fmt_status(esc.snapshot()))
                         time.sleep(0.2)
                 except KeyboardInterrupt:
@@ -374,6 +1079,20 @@ def do_repl(esc: Escape32) -> None:
             elif verb == "trace":
                 do_trace(esc, int(args[0]),
                          float(args[1]) if len(args) > 1 else 2.0)
+            elif verb == "bemf":
+                do_bemf(esc, float(args[0]) if args else 5.0)
+            elif verb == "hsls":
+                do_hsls(esc)
+            elif verb == "zc":
+                do_zc(esc, int(args[0]) if args else 200,
+                      float(args[1]) if len(args) > 1 else 3.0)
+            elif verb == "sine":
+                do_sine(esc, int(args[0]) if args else 200,
+                        int(args[1]) if len(args) > 1 else 10,
+                        float(args[2]) if len(args) > 2 else 3.0)
+            elif verb == "power":
+                do_power(esc, int(args[0]),
+                         float(args[1]) if len(args) > 1 else 1.5)
             elif verb == "ramp":
                 do_ramp(esc, int(args[0]),
                         int(args[1]) if len(args) > 1 else 100,
@@ -404,6 +1123,8 @@ def main():
     p.add_argument("--trace", type=int, metavar="THROT",
                    help="hold this throttle, record commutation state, exit")
     p.add_argument("--secs", type=float, default=2.0, help="--trace duration")
+    p.add_argument("--bemf", action="store_true",
+                   help="motor-off BEMF check; turn the shaft by hand")
     p.add_argument("--ramp", type=int, metavar="MAX",
                    help="ramp to this throttle and exit (1..2000)")
     p.add_argument("--step", type=int, default=100)
@@ -433,11 +1154,33 @@ def main():
         esc = Escape32(ocd, syms)
         print(f"state block {esc.base:#x}..{esc.base + esc.span:#x} "
               f"({esc.span} bytes) from {os.path.relpath(elf, HERE)}")
+        if ocd.state() == "halted":
+            # Left over from a previous session's reset catch, or a
+            # `reset halt` fallback: the firmware is not running at all.
+            print(f"target was halted ({esc.reset_cause()}); resuming")
+            ocd.cmd("resume")
+            time.sleep(0.5)
         if esc.get("throt") == 1:
             print("ESC is in the power-on arming loop; sending zero throttle")
         esc.arm()
+        # bemf/power clear MOE to float the phases and restore it in a
+        # finally -- but a killed process skips that finally and strands the
+        # bridge disabled, so the firmware commutates with no output and the
+        # motor stays silent.  Catch that leftover on the next connect.
+        if not ocd.read(TIM1_BDTR) & TIM_BDTR_MOE:
+            print("TIM1 MOE is cleared (left over from a motor-off test); "
+                  "rebooting to restore it")
+            ocd.cmd("cortex_m vector_catch none")
+            ocd.cmd("reset halt")
+            ocd.cmd("resume")
+            time.sleep(0.6)
+            ocd.cmd("cortex_m vector_catch reset")
+            esc.last_tick = None
+            esc.arm()
         try:
-            if args.trace is not None:
+            if args.bemf:
+                do_bemf(esc, args.secs if args.secs != 2.0 else 5.0)
+            elif args.trace is not None:
                 do_trace(esc, args.trace, args.secs)
             elif args.ramp is not None:
                 if not 0 < args.ramp <= 2000:
