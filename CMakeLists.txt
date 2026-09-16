@@ -100,3 +100,29 @@ add_target(TMOTOR1 STM32F051 DEAD_TIME=26 COMP_MAP=132 IO_PA2 SMALL_DEVICE)
 add_target(TMOTOR2 STM32F051 DEAD_TIME=26 COMP_MAP=321 SMALL_DEVICE)
 add_target(TMOTOR3 STM32G071 DEAD_TIME=35 COMP_MAP=231 IO_PA6)
 add_target(TMOTOR4 STM32G071 DEAD_TIME=35 COMP_MAP=123)
+
+# MOUSEG431: custom board, STM32G431KBU6 (UFQFPN32) + MP6540HA.
+#
+# Pin usage matches this MCU target's DEFAULT configuration exactly, so
+# no USE_PB1 / USE_XOR / PWM_ENABLE / USE_HSE options are needed:
+#   6PWM  : PA8/PA9/PA10 (TIM1_CH1/2/3), PA7/PB0/PF0 (TIM1_CH1N/2N/3N)
+#           PF0 (not PB1) for CH3N -- PB1 does not exist on UFQFPN32.
+#   BEMF  : PA0/PA4/PA5 (phases), PA1+PA3 (virtual neutral, star network)
+#   Input : PA2 (TIM15_CH1)
+#   SWD   : PA13/PA14
+# MP6540HA is driven through its 6 independent HS/LS gate inputs, so the
+# MCU generates the dead time itself (PWM_ENABLE, which is for PWM+EN
+# style drivers, must NOT be set).
+#
+# DEAD_TIME=92: 92/168MHz = 548ns, carried over from the 552ns value
+# measured on the previous AT32F425 board with the same MP6540HA driver
+# (53 ticks @ 96MHz). Re-verify on hardware.
+# COMP_MAP=123: identity mapping, carried over from the same board
+# (BEMF A/B/C = PA0/PA4/PA5).
+# No SENS_MAP: PA6 (volt) and PF1 (curr) are left unconnected on this
+# board, so voltage/current telemetry and the low-voltage/overcurrent
+# protections are compiled out.
+# No USE_HSE: PF0/PF1 are the OSC pins and PF0 is used for TIM1_CH3N, so
+# there is no crystal -- HSI16+PLL gives the same 168MHz, and THROT_CAL
+# defaults to 1 (automatic throttle calibration) as a result.
+add_target(MOUSEG431 STM32G431 DEAD_TIME=92 COMP_MAP=123)
