@@ -236,6 +236,12 @@ void at32_hardfault_capture(void) {
 	hardfault_diag.magic = HARDFAULT_DIAG_MAGIC; // Written LAST -- a debugger checking this first is guaranteed to see fully-populated fields
 }
 
+// upstream's own commutation-interval estimate, read-only. Used by
+// compctl() below to size the post-commutation blanking window
+// proportionally to the actual interval (see there), and by the
+// BENCH_TEST confirm log.
+extern int ival;
+
 #ifdef BENCH_TEST
 // Read-only diagnostic visibility into upstream's iftim_isr() accept/
 // reject decision (src/main.c: `if (t < ival >> 1) return;`), its
@@ -244,7 +250,7 @@ void at32_hardfault_capture(void) {
 // `static` removed (main.c, zero behavior change) specifically for
 // this. The algorithm itself is not touched anywhere. ertm/erpm are
 // already non-static (src/common.h) and need no change.
-extern int step, ival, sine;
+extern int step, sine;
 extern char sync;
 #endif
 
@@ -276,6 +282,7 @@ extern char sync;
 // `sync` gets (0-6, upstream's own "how locked is closed-loop" signal),
 // and whether/when synchronization is lost -- not any duty percentage.
 #define BENCH_TIME_LIMIT_TICKS 500 // 500 * 10ms = 5.0s hard overall limit
+#define BENCH_MAX_POST_LOCK_TIMEOUTS 25 // Desync (post-lock IFTIM timeout) budget for one run -- exceeded means it never really held sync, so stop
 #define BENCH_LOCK_SYNC_THRESHOLD 6 // upstream's own full-lock threshold (nextstep(): `if (sync < 6) return;`) -- once reached, a subsequent ZC timeout is treated as a genuine desync (stop), not startup noise
 
 #define BENCH_CONFIRM_LOG_N 16
@@ -317,6 +324,7 @@ typedef struct {
 	uint32_t uif_count;         // IFTIM timeouts (expected during initial bootstrap, before lock is ever established -- see BENCH_LOCK_SYNC_THRESHOLD)
 	uint32_t fault_count;       // 0 or 1 -- see tim3_isr()'s fault trigger
 	uint32_t sync_max;          // Highest upstream `sync` value (0-6) ever observed -- 6 means full lock was genuinely reached at least once
+	uint32_t post_lock_uif_count; // IFTIM timeouts that happened AFTER full lock was first reached -- i.e. genuine desync events, each one costing a 32.767ms re-bootstrap
 	uint32_t erpm_max;          // Highest upstream `erpm` value ever observed -- upstream's own electrical-RPM estimate, only meaningful once sync>=6 (ertm is a real measurement, not the 1e8 UIF-timeout placeholder, from that point on)
 	// ival ESTIMATE reconstructed from IFTIM_OCR via upstream's own
 	// formula inverted: OCR = max((ival-(ival*cfg.timing>>5))>>1, 1);
@@ -375,7 +383,7 @@ static void bench_force_stop(int reason) {
 // there, upstream's OWN duty_spup/duty_ramp/duty_rate mechanism (see
 // this file's top comment) is solely responsible for how much of that
 // commanded throttle actually reaches the motor.
-#define BENCH_THROT_RAMP_STEP 10  // Per 10ms tick (this function's own cadence)
+#define BENCH_THROT_RAMP_STEP 3   // Per 10ms tick (this function's own cadence) -- deliberately slow: the sine ramp is OPEN LOOP, so throttle (which is what sweeps `sine` from 1000 down to 145 ticks/microstep) must not outrun the rotor's actual ability to accelerate, or it just slips and vibrates. At 3/tick the sine window (throt 50->310) takes ~870ms instead of ~250ms.
 #define BENCH_THROT_RAMP_MAX 2000 // Full throttle range -- upstream's own duty_spup/duty_ramp governor (not this) is what actually paces real output
 
 void tim14_isr(void) {
@@ -431,16 +439,40 @@ static void bench_test_init(void) {
 		return; // throt stays 0 -- main()'s control loop never sets running=1
 	}
 
-	// Enable upstream's own sine-startup ramp (off by default,
-	// SINE_RANGE=0 -- see src/defs.h) and start throt WITHIN its window
-	// (range = cfg.sine_range*20 = 300, minus the ramp's own hysteresis
-	// delta) so main()'s control loop actually enters the sine branch
-	// instead of jumping straight to 6-step. tim14_isr() (above) ramps
-	// throt upward every 10ms until it naturally crosses the sine_range
-	// boundary, triggering upstream's own (unmodified) handover to
-	// 6-step -- no separate startup FSM.
+	// STARTUP MODE SWITCH (A/B comparison).
+	//
+	// BENCH_SINE_STARTUP=1: enable upstream's own sine-startup ramp (off
+	//   by default, SINE_RANGE=0 -- see src/defs.h) and start throt
+	//   WITHIN its window (range = cfg.sine_range*20 = 300, minus the
+	//   ramp's own hysteresis delta) so main()'s control loop actually
+	//   enters the sine branch instead of jumping straight to 6-step.
+	//   tim14_isr() ramps throt upward every 10ms until it naturally
+	//   crosses the sine_range boundary, triggering upstream's own
+	//   (unmodified) handover to 6-step.
+	//
+	// BENCH_SINE_STARTUP=0: no sine assist at all -- straight into
+	//   6-step from standstill, with throttle commanded at max from the
+	//   first tick so that cfg.duty_spup/duty_ramp (below), not the
+	//   throttle ramp, are what actually govern applied duty. NOTE: with
+	//   sine disabled, a low starting throt is NOT usable -- newduty
+	//   scales linearly from throt, so throt=50 would command roughly 2%
+	//   duty and never move the rotor at all.
+	//
+	// Measured with sine startup ON (5s run, duty capped at 40%): full
+	// lock (sync=6) was reached and held to the end, but 99 of the run's
+	// IFTIM timeouts all landed BEFORE that first lock -- ~3.2s of the
+	// 5s spent juddering in open-loop bootstrap before closed loop took
+	// over. The rough running the motor shows is that startup phase, not
+	// the (already square-wave) 6-step steady state.
+#define BENCH_SINE_STARTUP 1
+#if BENCH_SINE_STARTUP
 	cfg.sine_range = 15;
+	cfg.sine_power = 12; // Default 8 gives p=64 = 50% of the sine table amplitude; 12 -> p=96 (75%) for more torque to actually drag the rotor along the open-loop ramp. Not maxed (15) while the supply/driver rework is still pending.
 	throt = 50;
+#else
+	cfg.sine_range = 0;
+	throt = BENCH_THROT_RAMP_MAX;
+#endif
 
 	// Real final duty ceiling (100, set ONCE -- not stepped) plus
 	// upstream's own erpm-gated acceleration governor: duty_spup=30 is
@@ -452,7 +484,20 @@ static void bench_test_init(void) {
 	// of DUTY_RAMP=0's default instant-100%-the-moment-erpm-is-nonzero
 	// jump (scale()'s degenerate zero-width-range behavior). duty_rate
 	// (curduty slew-rate limit) is left at upstream's own default.
-	cfg.duty_max = 100;
+	// duty_max is deliberately NOT 100 here: a run at full duty ended in
+	// a supply brownout severe enough to take the CPU down (double fault
+	// -> lockup, then SWD unreachable) and a physically hot driver IC.
+	// Capped low until the reworked board/supply is in place -- this run
+	// only needs to validate the sine-microstep pacing fix, which does
+	// not require full duty.
+	// duty_min is NOT left at upstream's default 1%: newduty scales
+	// linearly from the sine-window boundary, so at the instant of
+	// sine->6-step handover the commanded duty collapses to duty_min
+	// and only recovers as throttle keeps ramping. With the slow ramp
+	// that recovery took ~1s -- long enough for the rotor to decelerate
+	// and desync (measured: sync stalled at 2, 123 timeouts in 5s).
+	cfg.duty_min = 25;
+	cfg.duty_max = 40;
 	cfg.duty_spup = 30;
 	cfg.duty_ramp = 10;
 }
@@ -506,7 +551,20 @@ static const uint8_t comp_in_to_adc_idx[4] = {0xff, PHASE_IDX_1, PHASE_IDX_2, PH
 // outlier) while staying far shorter than the ~32.767ms open-loop
 // bootstrap step -- a data-driven experiment, not a guess; revisit if
 // real accepts still don't appear.
-#define POST_COMMUTATION_BLANK_SCANS 24
+// Post-commutation blanking, sized as a FRACTION OF THE ACTUAL
+// COMMUTATION INTERVAL rather than a fixed scan count. A fixed 24
+// scans (~1000us at the 24kHz ADC trigger rate) was measured to
+// outlast the commutation period itself once the motor got moving
+// (mean interval 564us at ~6850 erpm) -- ZC detection was buried in
+// the blank window at speed, so it timed out and desynced ~8 times a
+// second. ADC_SCAN_TICKS is one PWM period expressed in IFTIM ticks
+// (24kHz -> 41.67us -> ~83 ticks at 0.5us/tick); blanking targets
+// about an eighth of `ival` (upstream's own ZC-to-ZC interval
+// estimate), i.e. roughly a quarter of one commutation period,
+// clamped to stay sane at both extremes.
+#define ADC_SCAN_TICKS ((CLK_KHZ / 24) / (CLK_MHZ >> (IFTIM_XRES + 1)))
+#define POST_COMMUTATION_BLANK_SCANS_MIN 2
+#define POST_COMMUTATION_BLANK_SCANS_MAX 24
 #define ADC_TRIGGER_OFFSET_TICKS 115 // ~1.2us, Stage E14/E23-validated
 
 // ZC state, armed by compctl() (called from upstream's nextstep(),
@@ -539,7 +597,10 @@ void compctl(int x) {
 	zc_rise.confirm_run = 0;
 	zc_fall.confirmed_sign = 1;
 	zc_fall.confirm_run = 0;
-	zc_blank_remaining = POST_COMMUTATION_BLANK_SCANS;
+	int blank = ival / (8 * ADC_SCAN_TICKS);
+	if (blank < POST_COMMUTATION_BLANK_SCANS_MIN) blank = POST_COMMUTATION_BLANK_SCANS_MIN;
+	else if (blank > POST_COMMUTATION_BLANK_SCANS_MAX) blank = POST_COMMUTATION_BLANK_SCANS_MAX;
+	zc_blank_remaining = blank;
 }
 
 static int zc_filter_update(volatile zc_filter_t *f, int diff) {
@@ -790,7 +851,11 @@ void tim7_isr(void) {
 	// timeouts are an expected, tolerated part of first lock-in.
 	if (!bench_stopped) {
 		bench_run.uif_count++;
-		if (bench_lock_established) bench_force_stop(BENCH_STOP_ZC_TIMEOUT);
+		// Stopping on the FIRST post-lock timeout makes the run too short
+		// to observe on real hardware (it ended at ~1.2s). Tolerate a
+		// bounded number of desyncs -- upstream re-bootstraps and can
+		// re-acquire on its own -- and stop only if they keep piling up.
+		if (bench_lock_established && ++bench_run.post_lock_uif_count >= BENCH_MAX_POST_LOCK_TIMEOUTS) bench_force_stop(BENCH_STOP_ZC_TIMEOUT);
 	}
 #endif
 	iftim_timeout();
