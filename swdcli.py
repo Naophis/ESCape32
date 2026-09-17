@@ -31,8 +31,11 @@ import shutil
 import socket
 import subprocess
 import sys
+import select
 import tempfile
+import termios
 import time
+import tty
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OPENOCD = os.environ.get(
@@ -161,6 +164,27 @@ def load_symbols(elf: str) -> dict[str, tuple[int, int, bool]]:
     if missing:
         raise RuntimeError(f"{elf}: symbols not found: {sorted(missing)}")
     return syms
+
+
+# Linker exports (src/common.h): _cfg is the flash page the saved config lives
+# in, _cfg_start.._cfg_end the SRAM copy that is the live `cfg`.  savecfg()
+# writes the latter over the former; `save` here does exactly that over SWD.
+LINKER = ("_cfg", "_cfg_start", "_cfg_end", "_boot")
+
+
+def load_linker_symbols(elf: str) -> dict[str, int]:
+    nm = shutil.which("arm-none-eabi-nm") or shutil.which("nm")
+    out = subprocess.run([nm, elf], capture_output=True, text=True,
+                         check=True).stdout
+    found = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[2] in LINKER:
+            found[parts[2]] = int(parts[0], 16)
+    missing = set(LINKER) - set(found)
+    if missing:
+        raise RuntimeError(f"{elf}: linker symbols not found: {sorted(missing)}")
+    return found
 
 
 class OpenOCD:
@@ -371,9 +395,16 @@ class Escape32:
             off = addr - self.base
             out[name] = int.from_bytes(blob[off:off + size], "little",
                                        signed=signed)
-        if self.last_tick is not None and out["tick"] < self.last_tick:
+        # A tick below the last one is only a *suspected* reboot: a single
+        # corrupted read (SWD noise while the motor runs) looks identical.
+        # The suspicion is not allowed to move last_tick, and the next sane
+        # read clears it; check_reset() confirms before acting on it.
+        t = out["tick"]
+        if self.last_tick is None or t >= self.last_tick:
+            self.last_tick = t
+            self.rebooted = False
+        else:
             self.rebooted = True
-        self.last_tick = out["tick"]
         return out
 
     def arm(self) -> None:
@@ -415,7 +446,18 @@ class Escape32:
             self.snapshot()          # refreshes self.rebooted
             if not self.rebooted:
                 return False
-            print(f"  FIRMWARE REBOOTED{when}: power-class reset (BOR/POR) -- "
+            # Confirm before acting.  Acting on a false reboot re-arms with
+            # throttle 0 -- the motor stops for no visible reason.  A real
+            # reboot is unmistakable on a second look 30 ms later: tick is
+            # still below the old value, and the firmware is back in its
+            # arming loop (throt primed to 1) or at the very least not
+            # commutating.  A glitch reads sane again, or shows step != 0.
+            time.sleep(0.03)
+            s2 = self.snapshot()
+            if not self.rebooted or not (s2["throt"] == 1 or s2["step"] == 0):
+                self.rebooted = False
+                return False
+            print(f"\n  FIRMWARE REBOOTED{when}: power-class reset (BOR/POR) -- "
                   "the debug port was\n  lost with it, so the cause flags "
                   "were already cleared by boot.")
         self.rebooted = False
@@ -1091,6 +1133,143 @@ def do_sine(esc: Escape32, throt: int, power: int, secs: float) -> None:
               + (f" | ERPM {min(erpms)}..{max(erpms)}" if erpms else ""))
 
 
+def do_knob(esc: Escape32, step: int) -> None:
+    """Drive the throttle from the keyboard, live.
+
+      up / down      +step / -step        (also + / -)
+      PgUp / PgDn    +4*step / -4*step
+      right / left   double / halve the step
+      space or 0     throttle 0
+      q or Esc       throttle 0 and back to the prompt
+
+    The status line refreshes about five times a second between keys, so
+    sync / ERPM / pwm can be watched while nudging.  Leaving always cuts the
+    throttle: a prompt sitting in front of a spinning motor is how accidents
+    happen.  A failed SWD write is reported on its own line and the knob
+    keeps working; a reboot re-arms and drops the level back to 0.
+    """
+    if not sys.stdin.isatty():
+        print("knob needs a terminal")
+        return
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    level = esc.get("throt")
+    if level < 0 or level == 1:   # 1 is the arming-loop primer, not a setpoint
+        level = 0
+    print(f"knob: step {step}   up/down  PgUp/PgDn x4  left/right = step /2 x2  "
+          "space = 0   q = quit (cuts throttle)")
+    tty.setcbreak(fd)   # no echo, no line buffering; Ctrl-C still works
+    try:
+        while True:
+            try:
+                st = esc.snapshot()
+                line = fmt_status(st) + pwm_str(esc)
+            except RuntimeError as e:
+                line = f"(read failed: {str(e).splitlines()[0]})"
+            sys.stdout.write(f"\r\x1b[K[step {step:4d}] {line}")
+            sys.stdout.flush()
+            if esc.rebooted and esc.check_reset():   # confirmed, not a glitch
+                level = 0
+                continue
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if not ready:
+                continue
+            key = os.read(fd, 1)
+            delta = None
+            if key == b"\x1b":
+                ready, _, _ = select.select([fd], [], [], 0.05)
+                seq = os.read(fd, 8) if ready else b""
+                if seq == b"":            # lone Esc
+                    break
+                elif seq == b"[A":
+                    delta = step
+                elif seq == b"[B":
+                    delta = -step
+                elif seq == b"[5~":
+                    delta = 4 * step
+                elif seq == b"[6~":
+                    delta = -4 * step
+                elif seq == b"[C":
+                    step = min(step * 2, 500)
+                elif seq == b"[D":
+                    step = max(step // 2, 1)
+            elif key in (b"+", b"="):
+                delta = step
+            elif key in (b"-", b"_"):
+                delta = -step
+            elif key in (b" ", b"0"):
+                level, delta = 0, 0
+            elif key in (b"q", b"Q"):
+                break
+            if delta is None:
+                continue
+            level = max(0, min(2000, level + delta))
+            try:
+                esc.set_throt(level)
+            except RuntimeError as e:
+                sys.stdout.write(f"\n  write failed ({str(e).splitlines()[0]}) -- "
+                                 "level not applied, press again\n")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        esc.safe_stop()
+        print("\nthrottle cut")
+
+
+def do_save(esc: Escape32, lsyms: dict[str, int]) -> None:
+    """Persist the live cfg to the flash config page -- ESCape32's `save`.
+
+    The firmware's own savecfg() copies _cfg_start.._cfg_end (the SRAM cfg,
+    i.e. what `cfg name value` has been editing) over the _cfg flash page and
+    reads it back at every boot (src/main.c:559).  Doing the same with
+    OpenOCD's `program` is byte-for-byte equivalent, and needs no UART.
+
+    `program` resets the core to do the flashing, so the ESC reboots: it
+    reloads the page it just got, lands in its arming loop, and is re-armed
+    here.  That reboot doubles as the proof that the saved values load.
+    Refused while the motor runs, like the firmware refuses (`ertm`).
+    """
+    st = esc.snapshot()
+    if st["step"] or st["throt"] or st["ertm"]:
+        print("motor is running -- `stop` first (the ESC reboots during save)")
+        return
+    ram, ram_end, page = lsyms["_cfg_start"], lsyms["_cfg_end"], lsyms["_cfg"]
+    size = ram_end - ram
+    data = esc.ocd.read_bytes(ram, size)[:size]
+    before = {n: esc.ocd.read(a, 8) for n, (a, _, _) in CFG_FIELDS.items()}
+    with tempfile.NamedTemporaryFile(prefix="escape32-cfg-", suffix=".bin",
+                                     delete=False) as f:
+        f.write(data)
+        path = f.name
+    try:
+        print(f"writing {size} bytes of cfg to {page:#x} ...")
+        esc.ocd.cmd(f"program {path} {page:#x} verify")
+        # program's console text does not reliably come back over the Tcl
+        # port, so verify by reading the page back rather than parsing it.
+        back = esc.ocd.read_bytes(page, size)[:size]
+        if back != data:
+            diff = next(i for i in range(size) if back[i] != data[i])
+            print(f"  FLASH MISMATCH at offset {diff} -- save failed, not resuming")
+            return
+        print(f"  flash page verified ({size} bytes match)")
+        esc.ocd.cmd("resume")
+        time.sleep(0.6)
+        esc.last_tick = None
+        esc.rebooted = False
+        esc.arm()
+        after = {n: esc.ocd.read(a, 8) for n, (a, _, _) in CFG_FIELDS.items()}
+        bad = [n for n in before if before[n] != after[n]]
+        if bad:
+            print("  MISMATCH after reboot: " + ", ".join(f"{n} {before[n]}->{after[n]}" for n in bad))
+        else:
+            print("  saved; ESC rebooted and reloaded the same values:")
+            for n in CFG_FIELDS:
+                print(f"    {n:11s} {after[n]}")
+    finally:
+        os.unlink(path)
+
+
 def do_ramp(esc: Escape32, stop: int, step: int, dwell: float) -> None:
     """Walk the throttle setpoint up, reporting ERPM at each level.
 
@@ -1114,14 +1293,16 @@ def do_ramp(esc: Escape32, stop: int, step: int, dwell: float) -> None:
         print("throttle cut")
 
 
-def do_repl(esc: Escape32) -> None:
+def do_repl(esc: Escape32, lsyms: dict[str, int] | None = None) -> None:
     print("commands:  throt <-2000..2000> | stop | status | watch [sec]")
     print("           trace <throt> [sec]        commutation/sync trace")
     print("           zc <throt> [sec]           per-step comparator ZC check")
     print("           sine <throt> [pow] [sec]   open-loop sine startup")
     print("           ramp <max> [step] [dwell]  step throttle up")
     print("           bemf [sec] | hsls | power <throt> [sec]")
-    print("           cfg [field [value]]   runtime cfg (timing, duty_max, ...; RAM only)")
+    print("           knob [step]           keyboard throttle: arrows / PgUp PgDn / space=0 / q")
+    print("           cfg [field [value]]   runtime cfg (timing, duty_max, ...; RAM until saved)")
+    print("           save                  write the live cfg to the flash config page (ESC reboots)")
     print("           reset | quit")
     while True:
         try:
@@ -1180,12 +1361,19 @@ def do_repl(esc: Escape32) -> None:
             elif verb == "power":
                 do_power(esc, int(args[0]),
                          float(args[1]) if len(args) > 1 else 1.5)
+            elif verb in ("knob", "k"):
+                do_knob(esc, int(args[0]) if args else 50)
             elif verb == "ramp":
                 do_ramp(esc, int(args[0]),
                         int(args[1]) if len(args) > 1 else 100,
                         float(args[2]) if len(args) > 2 else 1.0)
             elif verb == "cfg":
                 do_cfg(esc, args)
+            elif verb == "save":
+                if lsyms is None:
+                    print("save unavailable (no ELF symbols)")
+                else:
+                    do_save(esc, lsyms)
             elif verb == "reset":
                 esc.ocd.cmd("reset run")
                 time.sleep(1.5)  # let the arming loop come back up
@@ -1241,6 +1429,7 @@ def main():
 
     try:
         syms = load_symbols(elf)
+        lsyms = load_linker_symbols(elf)
     except (RuntimeError, subprocess.CalledProcessError) as e:
         return str(e)
 
@@ -1286,7 +1475,7 @@ def main():
                     return "--ramp must be within 1..2000"
                 do_ramp(esc, args.ramp, args.step, args.dwell)
             else:
-                do_repl(esc)
+                do_repl(esc, lsyms)
         finally:
             esc.safe_stop()
     return 0
