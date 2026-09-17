@@ -81,6 +81,25 @@ TIM2_TISEL = 0x4000005C   # 0x1 = TI1 from COMP1_OUT, 0x2 = from COMP2_OUT
 # long as it is put back.
 TIM1_BDTR = 0x40012C44
 TIM_BDTR_MOE = 1 << 15
+TIM1_ARR = 0x40012C2C
+TIM1_CCR1 = 0x40012C34
+
+# Runtime copy of cfg (src/common.h Cfg, base 0x20000000): name -> (addr, min, max).
+# The CLI's `set` runs checkcfg() to clamp values; a raw RAM write does not, so
+# the ranges are enforced here.  RAM only: reverts on reset, cannot be saved
+# without the UART CLI.
+CFG_FIELDS = {
+    "timing":     (0x20000018, 1, 31),    # commutation advance: 16 = 15 deg, 31 ~ 29 deg
+    "sine_range": (0x20000019, 0, 25),    # 0 = off, else 5..25 (% of throttle)
+    "sine_power": (0x2000001a, 1, 15),
+    "freq_min":   (0x2000001b, 16, 48),   # PWM kHz
+    "freq_max":   (0x2000001c, 16, 96),
+    "duty_min":   (0x2000001d, 1, 100),
+    "duty_max":   (0x2000001e, 1, 100),
+    "duty_spup":  (0x2000001f, 1, 100),   # spin-up duty cap (%)
+    "duty_ramp":  (0x20000020, 0, 100),   # kERPM; 0 = governor off
+    "duty_rate":  (0x20000021, 1, 100),   # %/ms
+}
 
 RCC_CSR = 0x40021094
 RESET_FLAGS = [(31, "LPWR"), (30, "WWDG"), (29, "IWDG"), (28, "SFT"),
@@ -219,10 +238,18 @@ class OpenOCD:
         commutations at all.
         """
         if addr % 4 == 0:
-            words = self._nums(
-                self.cmd(f"read_memory {addr:#x} 32 {(count + 3) // 4}"),
-                f"read {addr:#x}")
-            return b"".join(w.to_bytes(4, "little") for w in words)
+            err = None
+            for _ in range(self.RETRIES):
+                try:
+                    words = self._nums(
+                        self.cmd(f"read_memory {addr:#x} 32 {(count + 3) // 4}"),
+                        f"read {addr:#x}")
+                    return b"".join(w.to_bytes(4, "little") for w in words)
+                except RuntimeError as e:
+                    err = e
+                    time.sleep(0.02)
+            raise RuntimeError(f"{err} (after {self.RETRIES} tries)\n"
+                               + self._log_tail(3).rstrip())
         byts = self._nums(self.cmd(f"read_memory {addr:#x} 8 {count}"),
                           f"read {addr:#x}")
         return bytes(b & 0xff for b in byts)
@@ -238,18 +265,41 @@ class OpenOCD:
         except ValueError:
             raise RuntimeError(f"{what}: openocd said {reply!r}") from None
 
+    # A failed SWD transaction is retried before it counts.  Motor switching
+    # noise on the SWD wires, or the target browning out for a moment at the
+    # start-up kick, makes OpenOCD answer 'failed to read/write memory' on an
+    # otherwise healthy link; a retry 20 ms later usually goes through.  When
+    # it still fails, the last openocd log lines are attached: "Fail reading
+    # CTRL/STAT ... Force reconnect" there means the debug port itself dropped
+    # -- a reset or power event, not a glitch -- which is worth knowing at once.
+    RETRIES = 3
+
     def read(self, addr: int, width: int = 32) -> int:
-        return self._nums(self.cmd(f"read_memory {addr:#x} {width} 1"),
-                          f"read {addr:#x}")[0]
+        err = None
+        for _ in range(self.RETRIES):
+            try:
+                return self._nums(self.cmd(f"read_memory {addr:#x} {width} 1"),
+                                  f"read {addr:#x}")[0]
+            except RuntimeError as e:
+                err = e
+                time.sleep(0.02)
+        raise RuntimeError(f"{err} (after {self.RETRIES} tries)\n"
+                           + self._log_tail(3).rstrip())
 
     def write(self, addr: int, value: int, width: int = 32) -> None:
         masked = value & ((1 << width) - 1)
-        reply = self.cmd(f"write_memory {addr:#x} {width} {{{masked}}}")
-        # A successful write_memory answers with nothing at all.  Anything
-        # else is an error, and a silently failed `throt 0` is the one
-        # failure this tool must never swallow.
-        if reply:
-            raise RuntimeError(f"write {addr:#x}: openocd said {reply!r}")
+        reply = ""
+        for _ in range(self.RETRIES):
+            # A successful write_memory answers with nothing at all.  Anything
+            # else is an error, and a silently failed `throt 0` is the one
+            # failure this tool must never swallow.
+            reply = self.cmd(f"write_memory {addr:#x} {width} {{{masked}}}")
+            if not reply:
+                return
+            time.sleep(0.02)
+        raise RuntimeError(f"write {addr:#x}: openocd said {reply!r} "
+                           f"(after {self.RETRIES} tries)\n"
+                           + self._log_tail(3).rstrip())
 
     def close(self) -> None:
         if self.sock:
@@ -384,6 +434,42 @@ class Escape32:
                 self.ocd.cmd("reset halt")
             except Exception:
                 pass
+
+
+def pwm_str(esc: Escape32) -> str:
+    """Actual PWM duty on the bridge, read from TIM1 itself.
+
+    `throt 2000` is 100 % of the throttle range, and with duty_max=100 that
+    should land here as ~100 % duty.  This is the number that says whether it
+    really does, or whether duty_max / duty_ramp / the spin-up governor is
+    holding it back.  Only meaningful while the motor is running (step != 0);
+    at idle CCR1 is stale.
+    """
+    arr = esc.ocd.read(TIM1_ARR)
+    ccr = esc.ocd.read(TIM1_CCR1)
+    return f"  pwm {ccr * 100 / (arr + 1):5.1f}%" if arr else ""
+
+
+def do_cfg(esc: Escape32, args: list[str]) -> None:
+    """Read or write the runtime cfg fields listed in CFG_FIELDS."""
+    if not args:
+        for n, (a, lo, hi) in CFG_FIELDS.items():
+            print(f"  {n:11s} {esc.ocd.read(a, 8):3d}   [{lo}..{hi}]")
+        return
+    name = args[0]
+    if name not in CFG_FIELDS:
+        print("  unknown field; known: " + ", ".join(CFG_FIELDS))
+        return
+    a, lo, hi = CFG_FIELDS[name]
+    if len(args) == 1:
+        print(f"  {name} = {esc.ocd.read(a, 8)}")
+        return
+    v = int(args[1])
+    if not lo <= v <= hi or (name == "sine_range" and 0 < v < 5):
+        print(f"  {name}: allowed {lo}..{hi}" + (" (or 0)" if name == "sine_range" else ""))
+        return
+    esc.ocd.write(a, v, 8)
+    print(f"  {name} = {esc.ocd.read(a, 8)}   (RAM only -- reverts on reset)")
 
 
 def fmt_status(st: dict[str, int]) -> str:
@@ -1022,7 +1108,7 @@ def do_ramp(esc: Escape32, stop: int, step: int, dwell: float) -> None:
             esc.set_throt(level)
             time.sleep(dwell)
             print(f"  {level * 100 / 2000:5.1f}% of range   "
-                  f"{fmt_status(esc.snapshot())}")
+                  f"{fmt_status(esc.snapshot())}{pwm_str(esc)}")
     finally:
         esc.safe_stop()
         print("throttle cut")
@@ -1035,6 +1121,7 @@ def do_repl(esc: Escape32) -> None:
     print("           sine <throt> [pow] [sec]   open-loop sine startup")
     print("           ramp <max> [step] [dwell]  step throttle up")
     print("           bemf [sec] | hsls | power <throt> [sec]")
+    print("           cfg [field [value]]   runtime cfg (timing, duty_max, ...; RAM only)")
     print("           reset | quit")
     while True:
         try:
@@ -1058,12 +1145,12 @@ def do_repl(esc: Escape32) -> None:
                 # failure this board actually has; give it a chance to show.
                 time.sleep(0.3)
                 if not esc.check_reset():
-                    print(fmt_status(esc.snapshot()))
+                    print(fmt_status(esc.snapshot()) + pwm_str(esc))
             elif verb == "stop":
                 esc.set_throt(0)
                 print("throttle cut")
             elif verb == "status":
-                print(fmt_status(esc.snapshot()))
+                print(fmt_status(esc.snapshot()) + pwm_str(esc))
             elif verb == "watch":
                 secs = float(args[0]) if args else 5.0
                 end = time.time() + secs
@@ -1071,7 +1158,7 @@ def do_repl(esc: Escape32) -> None:
                     while time.time() < end:
                         if esc.check_reset():
                             break
-                        print(fmt_status(esc.snapshot()))
+                        print(fmt_status(esc.snapshot()) + pwm_str(esc))
                         time.sleep(0.2)
                 except KeyboardInterrupt:
                     esc.safe_stop()
@@ -1097,6 +1184,8 @@ def do_repl(esc: Escape32) -> None:
                 do_ramp(esc, int(args[0]),
                         int(args[1]) if len(args) > 1 else 100,
                         float(args[2]) if len(args) > 2 else 1.0)
+            elif verb == "cfg":
+                do_cfg(esc, args)
             elif verb == "reset":
                 esc.ocd.cmd("reset run")
                 time.sleep(1.5)  # let the arming loop come back up
@@ -1111,6 +1200,16 @@ def do_repl(esc: Escape32) -> None:
             print(f"bad arguments: {e}")
         except RuntimeError as e:
             print(f"error: {e}")
+            # Tell the two cases apart for the user: a link glitch leaves the
+            # firmware running (tick still advancing, command simply not
+            # applied) while a brownout/reset shows up as a reboot.
+            try:
+                if not esc.check_reset():
+                    print("  link glitch, target did not reboot -- the command was NOT "
+                          "applied, send it again")
+            except RuntimeError:
+                print("  target unreachable -- power or reset event? check the bench "
+                      "supply and the SWD/GND wiring")
 
 
 def main():
