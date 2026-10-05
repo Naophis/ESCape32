@@ -1133,7 +1133,7 @@ def do_sine(esc: Escape32, throt: int, power: int, secs: float) -> None:
               + (f" | ERPM {min(erpms)}..{max(erpms)}" if erpms else ""))
 
 
-def do_knob(esc: Escape32, step: int) -> None:
+def do_knob(esc: Escape32, step: int, start: int = 250) -> None:
     """Drive the throttle from the keyboard, live.
 
       up / down      +step / -step        (also + / -)
@@ -1141,6 +1141,13 @@ def do_knob(esc: Escape32, step: int) -> None:
       right / left   double / halve the step
       space or 0     throttle 0
       q or Esc       throttle 0 and back to the prompt
+
+    From rest the first nudge up jumps straight to `start` (default 250 =
+    12.5 %) rather than to one step: ESCape32's sensorless start needs a
+    decisive first kick, and creeping up from 2-3 % duty only makes the rotor
+    cog in place until the duty is finally large enough -- by which time the
+    rotor and the interval estimator are in a mess.  Coming down is left
+    alone.
 
     The status line refreshes about five times a second between keys, so
     sync / ERPM / pwm can be watched while nudging.  Leaving always cuts the
@@ -1156,8 +1163,8 @@ def do_knob(esc: Escape32, step: int) -> None:
     level = esc.get("throt")
     if level < 0 or level == 1:   # 1 is the arming-loop primer, not a setpoint
         level = 0
-    print(f"knob: step {step}   up/down  PgUp/PgDn x4  left/right = step /2 x2  "
-          "space = 0   q = quit (cuts throttle)")
+    print(f"knob: step {step}, first press from 0 -> {start}   up/down  PgUp/PgDn x4  "
+          "left/right = step /2 x2   space = 0   q = quit (cuts throttle)")
     tty.setcbreak(fd)   # no echo, no line buffering; Ctrl-C still works
     try:
         while True:
@@ -1203,7 +1210,10 @@ def do_knob(esc: Escape32, step: int) -> None:
                 break
             if delta is None:
                 continue
-            level = max(0, min(2000, level + delta))
+            if level == 0 and delta > 0:
+                level = min(2000, max(start, delta))   # decisive first kick from rest
+            else:
+                level = max(0, min(2000, level + delta))
             try:
                 esc.set_throt(level)
             except RuntimeError as e:
@@ -1300,7 +1310,7 @@ def do_repl(esc: Escape32, lsyms: dict[str, int] | None = None) -> None:
     print("           sine <throt> [pow] [sec]   open-loop sine startup")
     print("           ramp <max> [step] [dwell]  step throttle up")
     print("           bemf [sec] | hsls | power <throt> [sec]")
-    print("           knob [step]           keyboard throttle: arrows / PgUp PgDn / space=0 / q")
+    print("           knob [step] [start]   keyboard throttle: arrows / PgUp PgDn / space=0 / q")
     print("           cfg [field [value]]   runtime cfg (timing, duty_max, ...; RAM until saved)")
     print("           save                  write the live cfg to the flash config page (ESC reboots)")
     print("           reset | quit")
@@ -1362,7 +1372,8 @@ def do_repl(esc: Escape32, lsyms: dict[str, int] | None = None) -> None:
                 do_power(esc, int(args[0]),
                          float(args[1]) if len(args) > 1 else 1.5)
             elif verb in ("knob", "k"):
-                do_knob(esc, int(args[0]) if args else 50)
+                do_knob(esc, int(args[0]) if args else 50,
+                        int(args[1]) if len(args) > 1 else 250)
             elif verb == "ramp":
                 do_ramp(esc, int(args[0]),
                         int(args[1]) if len(args) > 1 else 100,
