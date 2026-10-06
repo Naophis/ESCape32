@@ -353,9 +353,31 @@ static int dshotcrc(int x, int inv) {
 	return a & 0xf;
 }
 
+// DSHOT_CMD 44 (unused by ESCape32 itself): the next steady value frame -- the
+// same value 6 frames in a row, telemetry bit set, motor stopped -- is a config
+// write rather than a throttle.  value - 48 = field << 7 | setting, with field
+// indexing the table below and setting 0..127.  checkcfg() clamps as the CLI's
+// `set` would, and the value actually stored is beeped back.  Persist with
+// DSHOT_CMD 12 as usual.  The rest of the value burst is swallowed until a stop
+// frame so it cannot turn into a throttle.  Added for the ExiaIgnis mouse
+// (send_file.py dshotcfg), which reaches the ESC through DSHOT only.
+static void cfgwrite(int v) {
+	static char *const fields[] = {
+		&cfg.timing, &cfg.sine_range, &cfg.sine_power, &cfg.freq_min, &cfg.freq_max,
+		&cfg.duty_min, &cfg.duty_max, &cfg.duty_spup, &cfg.duty_ramp, &cfg.duty_rate,
+		&cfg.volume, &cfg.beacon, &cfg.revdir, &cfg.damp, &cfg.duty_drag, &cfg.duty_lock,
+	};
+	int i = v >> 7;
+	if (i >= (int)(sizeof fields / sizeof *fields)) return;
+	*fields[i] = v & 127;
+	checkcfg();
+	beepval = *fields[i];
+}
+
 void iotim_dma_isr(void) { // DSHOT
 	static const char gcr[] = {0x19, 0x1b, 0x12, 0x13, 0x1d, 0x15, 0x16, 0x17, 0x1a, 0x09, 0x0a, 0x0b, 0x1e, 0x0d, 0x0e, 0x0f};
-	static char cmd, cnt, rep;
+	static char cmd, cnt, rep, cfgsel, cfgcnt;
+	static short cfgval;
 	DMA1_IFCR = DMA_IFCR_CTCIF(IOTIM_DMA);
 	if (DMA1_CCR(IOTIM_DMA) & DMA_CCR_DIR) {
 		dshotreset();
@@ -417,6 +439,23 @@ void iotim_dma_isr(void) { // DSHOT
 	int tlm = x & 0x10;
 	x >>= 5;
 	if (!x || x > 47) {
+		if (cfgsel) { // Config write in progress (DSHOT_CMD 44, see cfgwrite)
+			if (!x) { // Stop frame: the value burst is over
+				if (cfgsel == 2) cfgsel = 0;
+			} else if (cfgsel == 2) return; // Rest of the value burst is not a throttle
+			else if (!tlm || ertm) cfgsel = 0; // Plain throttle resumed: drop the request
+			else {
+				if (cfgval != x) {
+					cfgval = x;
+					cfgcnt = 0;
+				}
+				if (cfgcnt < 10 && ++cfgcnt == 6) { // Same value 6 frames in a row
+					cfgwrite(x - 48);
+					cfgsel = 2;
+				}
+				return;
+			}
+		}
 		if (tlm) telreq = 1; // Telemetry request
 		throt = x ? cfg.throt_mode ? (x > 1047 ? x - 1047 : 47 - x) << 1 : x - 47 : 0;
 		cmd = 0;
@@ -532,6 +571,12 @@ void iotim_dma_isr(void) { // DSHOT
 			if ((x = cfg.duty_rate / 10 + 1) > 10) x = 1;
 			cfg.duty_rate = x * 10;
 			beepval = x;
+			break;
+		case 44: // Config write follows (see cfgwrite)
+			if (cnt != 6) break;
+			cfgsel = 1;
+			cfgval = 0;
+			cfgcnt = 0;
 			break;
 		case 47: // Reset settings
 			if (cnt != 6) break;

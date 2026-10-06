@@ -21,6 +21,19 @@ CAUTION -- nothing on the ESC times the throttle out in this mode.  Whatever
 is written stays applied until something writes again, so if this process is
 killed outright the motor keeps spinning.  Keep a hand on the bench supply;
 that is the real emergency stop, not this script.
+
+Saving: `save` burns the live cfg into the flash config page the same way the
+firmware's own savecfg() does.  Two things about this board make that
+delicate.  OpenOCD's flash loader runs in the work area at 0x20000000, i.e. on
+top of the live cfg (stm32g4x.cfg, work-area-backup 0), so RAM is junk until
+the firmware reboots and reloads the page.  And the bootloader (BOOT4_PA2)
+only jumps to the application when the page starts with the magic 0x32ea
+(boot/src/main.c:100); a page without it parks the ESC in the bootloader for
+good, which from here looks like garbage in every field and no `tick`.
+`cfg` and `save` therefore check that the application is actually running
+first, `save` verifies the page and waits for the reboot, and `restore`
+rewrites the build's default page from the ELF to get out of a bootloader
+lock-up.
 """
 
 from __future__ import annotations
@@ -65,6 +78,18 @@ WANTED = {
     "throt":   (4, True),
 }
 
+# Where each field can legitimately be.  A bulk read that came back shifted
+# by a word (the failure mode of these SWD wires next to the bridge, worse at
+# 16.8 V) lands outside these at once -- step 129940, rev 6, throt 0 while
+# pwm climbs -- so a snapshot is re-read until it fits, and reported as a
+# glitch rather than as data when it never does.
+SANE = {
+    "step": (0, 6), "oldstep": (0, 6), "sync": (0, 6), "reverse": (0, 1),
+    "prep": (0, 1), "fast": (0, 1), "lock": (0, 2), "analog": (0, 1),
+    "throt": (-2000, 2000), "ival": (0, 1 << 20), "sine": (0, 1 << 20),
+    "ertm": (0, 100000000), "erpm": (0, 2000000), "cutback": (0, 1000),
+}
+
 
 # Comparator registers, and the three configurations compctl() installs --
 # copied verbatim from mcu/STM32G431/config.c, where they are commented
@@ -89,8 +114,7 @@ TIM1_CCR1 = 0x40012C34
 
 # Runtime copy of cfg (src/common.h Cfg, base 0x20000000): name -> (addr, min, max).
 # The CLI's `set` runs checkcfg() to clamp values; a raw RAM write does not, so
-# the ranges are enforced here.  RAM only: reverts on reset, cannot be saved
-# without the UART CLI.
+# the ranges are enforced here.  RAM only: reverts on reset unless `save`d.
 CFG_FIELDS = {
     "timing":     (0x20000018, 1, 31),    # commutation advance: 16 = 15 deg, 31 ~ 29 deg
     "sine_range": (0x20000019, 0, 25),    # 0 = off, else 5..25 (% of throttle)
@@ -102,11 +126,40 @@ CFG_FIELDS = {
     "duty_spup":  (0x2000001f, 1, 100),   # spin-up duty cap (%)
     "duty_ramp":  (0x20000020, 0, 100),   # kERPM; 0 = governor off
     "duty_rate":  (0x20000021, 1, 100),   # %/ms
+    # Offsets 327/328 per the ELF's DWARF (after music[256]).  beep() plays
+    # at max(volume, 25), so below 25 nothing changes; 100 is the loudest.
+    "volume":     (0x20000147, 0, 100),   # beep / startup music volume (%)
+    "beacon":     (0x20000148, 0, 100),   # DSHOT beacon volume (%)
 }
+# Cfg starts with `id` = 0x32ea (src/main.c cfgdata).  The bootloader checks
+# that halfword at the start of the flash page before it will jump to the
+# application (boot/src/main.c:100), so it doubles as the test for "is the
+# application running and is 0x20000000 really the cfg" -- anything else
+# there is bootloader stack or OpenOCD flash-loader residue.
+CFG_BASE = 0x20000000
+CFG_ID = 0x32ea
 
 RCC_CSR = 0x40021094
 RESET_FLAGS = [(31, "LPWR"), (30, "WWDG"), (29, "IWDG"), (28, "SFT"),
                (27, "BOR"), (26, "PIN"), (25, "OBL")]
+# Cortex-M4 fault / debug status, for a core found halted with no reset flag:
+# then it did not reset, it crashed or was halted by the debugger.
+SCB_CFSR = 0xE000ED28
+SCB_HFSR = 0xE000ED2C
+SCB_BFAR = 0xE000ED38
+DCB_DHCSR = 0xE000EDF0
+HFSR_BITS = [(1, "VECTTBL"), (30, "FORCED"), (31, "DEBUGEVT")]
+CFSR_BITS = [(0, "IACCVIOL"), (1, "DACCVIOL"), (3, "MUNSTKERR"), (4, "MSTKERR"),
+             (7, "MMARVALID"), (8, "IBUSERR"), (9, "PRECISERR"), (10, "IMPRECISERR"),
+             (11, "UNSTKERR"), (12, "STKERR"), (15, "BFARVALID"), (16, "UNDEFINSTR"),
+             (17, "INVSTATE"), (18, "INVPC"), (19, "NOCP"), (24, "UNALIGNED"),
+             (25, "DIVBYZERO")]
+DHCSR_S_LOCKUP = 1 << 19
+
+
+def bits(value: int, table: list[tuple[int, str]]) -> str:
+    names = [n for b, n in table if value >> b & 1]
+    return " (" + " ".join(names) + ")" if names else ""
 
 # Used by do_hsls() to drive one gate input at a time and read the phase back.
 TIM1_EGR = 0x40012C14
@@ -243,6 +296,13 @@ class OpenOCD:
         except OSError:
             return "(log unavailable)"
 
+    def log_grep(self, needles: tuple[str, ...], lines: int = 80) -> list[str]:
+        """Recent OpenOCD log lines mentioning any of `needles`.  OpenOCD says
+        why a core halted ("target halted due to ...") and when it saw a reset
+        or lost the port, and none of that comes back over the Tcl socket."""
+        return [l.strip() for l in self._log_tail(lines).splitlines()
+                if any(n in l for n in needles)]
+
     def cmd(self, line: str) -> str:
         self.sock.sendall(line.encode() + b"\x1a")
         buf = b""
@@ -372,6 +432,13 @@ class Escape32:
         # would never supply.
         self.last_tick: int | None = None
         self.rebooted = False
+        # Flash address of the cfg page (_cfg from the ELF); main() fills it in.
+        self.cfg_page: int | None = None
+        # Snapshots that never read back sane (see SANE); shown by trace.
+        self.glitches = 0
+        # Set when safe_stop() had to fall back to `reset halt`, so the next
+        # check_reset() does not report our own reset as the target's.
+        self.forced_reset = False
 
     def get(self, name: str) -> int:
         addr, size, signed = self.syms[name]
@@ -389,12 +456,21 @@ class Escape32:
         smear a single sample across several commutations -- useless for
         deciding whether `step` and `sync` move together.
         """
-        blob = self.ocd.read_bytes(self.base, self.span)
-        out = {}
-        for name, (addr, size, signed) in self.syms.items():
-            off = addr - self.base
-            out[name] = int.from_bytes(blob[off:off + size], "little",
-                                       signed=signed)
+        for attempt in range(6):
+            blob = self.ocd.read_bytes(self.base, self.span)
+            out = {}
+            for name, (addr, size, signed) in self.syms.items():
+                off = addr - self.base
+                out[name] = int.from_bytes(blob[off:off + size], "little",
+                                           signed=signed)
+            if (all(lo <= out[n] <= hi for n, (lo, hi) in SANE.items() if n in out)
+                    and self._consistent(out)):
+                break
+            time.sleep(0.005)
+        else:
+            self.glitches += 1
+            raise RuntimeError("snapshot corrupted 6x in a row (shifted bulk "
+                               "read, SWD noise)")
         # A tick below the last one is only a *suspected* reboot: a single
         # corrupted read (SWD noise while the motor runs) looks identical.
         # The suspicion is not allowed to move last_tick, and the next sane
@@ -406,6 +482,20 @@ class Escape32:
         else:
             self.rebooted = True
         return out
+
+    @staticmethod
+    def _consistent(out: dict[str, int]) -> bool:
+        """erpm is recomputed from ertm every main-loop pass (src/main.c:744,
+        60000000/ertm; 0 while ertm is 0 or the 100000000 'no sync' value),
+        so a snapshot in which the two disagree was not read from one
+        instant -- a shifted read whose values all happened to be in range
+        (`ertm 0` next to `ERPM 787`)."""
+        ertm, erpm = out["ertm"], out["erpm"]
+        if out["sync"] == 6 and out["step"] and not 0 < ertm < 100000000:
+            return False   # locked and commutating, yet no revolution time
+        if ertm <= 0 or ertm >= 100000000:
+            return erpm == 0
+        return abs(erpm - 60000000 // ertm) <= max(erpm // 8, 100)
 
     def arm(self) -> None:
         """Supply the zero throttle the power-on arming loop waits for."""
@@ -421,11 +511,120 @@ class Escape32:
         self.put("analog", 0)
         self.put("throt", value)
 
+    def firmware_alive(self) -> bool:
+        """True when the application is running: cfg.id in RAM carries the
+        bootloader's magic and `tick` is advancing.  False while the core is
+        halted, while the bootloader still has the chip, and while RAM holds
+        OpenOCD's flash-loader residue after a `save`."""
+        try:
+            if self.ocd.read(CFG_BASE, 16) != CFG_ID:
+                return False
+            t0 = self.get("tick")
+            time.sleep(0.02)
+            return self.get("tick") != t0
+        except RuntimeError:
+            return False
+
+    def wait_alive(self, timeout: float) -> bool:
+        """Poll firmware_alive() for up to `timeout` seconds."""
+        end = time.time() + timeout
+        while True:
+            if self.firmware_alive():
+                return True
+            if time.time() >= end:
+                return False
+            time.sleep(0.1)
+
+    def read_image(self, addr: int, size: int, tries: int = 5) -> bytes:
+        """A bulk read that is trusted only once it repeats.
+
+        A bulk read_memory over these noisy SWD wires can come back *shifted*
+        -- a word lost mid-block with the length intact -- and look perfectly
+        sane, which is how a saved cfg page once ended up with every field
+        from freq_max on moved down one word (duty_min 1 -> 30, duty_max
+        100 -> 30, ...).  So read until two consecutive reads agree.
+        """
+        prev = None
+        for _ in range(tries):
+            cur = self.ocd.read_bytes(addr, size)[:size]
+            if len(cur) == size and cur == prev:
+                return cur
+            prev = cur
+            time.sleep(0.02)
+        raise RuntimeError(f"bulk read of {size} bytes at {addr:#x} did not "
+                           f"repeat in {tries} tries -- SWD noise; try again")
+
+    def not_alive_hint(self) -> str:
+        """Where the chip is when the application is not running."""
+        parts = [f"core {self.ocd.state()}"]
+        try:
+            parts.append(f"RAM {CFG_BASE:#x} reads {self.ocd.read(CFG_BASE, 16):#06x} "
+                         f"(the app puts {CFG_ID:#06x} there)")
+            if self.cfg_page is not None:
+                magic = self.ocd.read(self.cfg_page, 16)
+                parts.append(f"flash page {self.cfg_page:#x} starts with {magic:#06x}")
+                if magic != CFG_ID:
+                    parts.append("<-- the bootloader will not jump to the app; "
+                                 "`restore` rewrites the page")
+        except RuntimeError as e:
+            parts.append(f"(read failed: {str(e).splitlines()[0]})")
+        return ", ".join(parts)
+
+    def reboot(self, timeout: float = 3.0) -> bool:
+        """Reset the ESC and wait for the application to come back up.
+
+        The vector catch is lifted for the duration: with it armed, `reset run`
+        parks the core at its reset vector, nothing runs until something
+        resumes it, and the next command starts with a spurious "TARGET RESET
+        ITSELF".  After the reset the bootloader sees SFTRSTF, answers the
+        (absent) updater and sits out one 500 ms receive timeout before it
+        jumps to the application (boot/src/main.c), so coming back takes
+        about a second.
+        """
+        self.ocd.cmd("cortex_m vector_catch none")
+        try:
+            self.ocd.cmd("reset run")
+            ok = self.wait_alive(timeout)
+        finally:
+            self.ocd.cmd("cortex_m vector_catch reset")
+        self.last_tick = None
+        self.rebooted = False
+        if ok:
+            self.arm()
+        return ok
+
+    def reset_flags(self) -> list[str]:
+        csr = self.ocd.read(RCC_CSR)
+        return [n for b, n in RESET_FLAGS if csr >> b & 1]
+
     def reset_cause(self) -> str:
-        """Decode RCC_CSR on a core halted at its reset vector."""
+        """Why the core is sitting halted.
+
+        RCC_CSR names a real reset (the vector catch parks the core before
+        main() can clear the flags).  No flag means no reset: the core
+        crashed or the debugger halted it, and then the PC, the fault status
+        registers and OpenOCD's own "target halted due to ..." line say which.
+        """
         csr = self.ocd.read(RCC_CSR)
         names = [n for b, n in RESET_FLAGS if csr >> b & 1]
-        return f"RCC_CSR={csr:#010x} ({', '.join(names) or 'no flags set'})"
+        out = [f"RCC_CSR={csr:#010x} ({', '.join(names) or 'no flags set'})"]
+        try:
+            out.append("pc " + self.ocd.cmd("reg pc").split()[-1])
+            hfsr, cfsr = self.ocd.read(SCB_HFSR), self.ocd.read(SCB_CFSR)
+            if hfsr or cfsr:
+                out.append(f"HFSR {hfsr:#010x}{bits(hfsr, HFSR_BITS)} "
+                           f"CFSR {cfsr:#010x}{bits(cfsr, CFSR_BITS)}")
+                if cfsr & (1 << 15):
+                    out.append(f"BFAR {self.ocd.read(SCB_BFAR):#010x}")
+            if self.ocd.read(DCB_DHCSR) & DHCSR_S_LOCKUP:
+                out.append("S_LOCKUP (double fault)")
+        except (RuntimeError, IndexError):
+            pass
+        said = self.ocd.log_grep(("halted due to", "lockup", "reset detected",
+                                  "Force reconnect", "Reconnecting", "Polling"))
+        if said:
+            out.append("openocd: " + " | ".join(said[-2:]))
+        return "; ".join(out)
 
     def check_reset(self, since: float | None = None) -> bool:
         """Notice either kind of self-reset and get the firmware going again.
@@ -439,11 +638,40 @@ class Escape32:
         """
         when = "" if since is None else f" {time.time() - since:.3f}s after throttle-on"
         if self.ocd.state() == "halted":
-            print(f"  TARGET RESET ITSELF{when}: {self.reset_cause()}")
-            self.ocd.cmd("resume")   # boots from reset; .bss init zeroes throt
-            time.sleep(0.5)
+            if self.forced_reset:
+                self.forced_reset = False
+                print("  core halted by swdcli's own `reset halt` fallback; rebooting the ESC")
+                ok = self.reboot()
+                if not ok:
+                    print("  firmware did not come back: " + self.not_alive_hint())
+                    self.rebooted = False
+                    self.last_tick = None
+                return True
+            cause = self.reset_cause()
+            if self.reset_flags():
+                print(f"  TARGET RESET ITSELF{when}: {cause}")
+                self.ocd.cmd("resume")   # boots from reset; .bss init zeroes throt
+                # The bootloader runs first and, after a software reset, sits
+                # out a 500 ms receive timeout before jumping to the app; RAM
+                # read before then is its stack, not the cfg.
+                ok = self.wait_alive(3.0)
+            else:
+                # No reset happened: the core crashed (fault handler) or the
+                # debugger halted it.  Resuming a crashed core just parks it
+                # in the handler again, so reboot instead.
+                print(f"  CORE HALTED WITHOUT A RESET{when}: {cause}")
+                print("  rebooting the ESC")
+                ok = self.reboot()
+            if not ok:
+                print("  firmware did not come back: " + self.not_alive_hint())
+                self.rebooted = False
+                self.last_tick = None
+                return True
         else:
-            self.snapshot()          # refreshes self.rebooted
+            try:
+                self.snapshot()      # refreshes self.rebooted
+            except RuntimeError:
+                return False         # unreadable, not evidence of a reset
             if not self.rebooted:
                 return False
             # Confirm before acting.  Acting on a false reboot re-arms with
@@ -469,13 +697,42 @@ class Escape32:
     def safe_stop(self) -> None:
         try:
             self.set_throt(0)
+            return
         except Exception:
-            # Last resort: a reset clears MOE, so the bridge goes open and
-            # the motor coasts rather than staying driven.
+            pass
+        # The write failed: the debug port dropped for a moment, either from
+        # noise on the SWD wires or because the target itself browned out.
+        # Look before resetting anything.  `tick` tells the two apart: it
+        # restarts from 0 on a reboot and only ever climbs otherwise.  RCC_CSR
+        # is shown too, but with PA2 floating on the bench the bootloader
+        # exits at once on UART noise and the app clears the flags within
+        # milliseconds, so "no flags" alone proves nothing.
+        for _ in range(3):
+            time.sleep(0.1)
             try:
-                self.ocd.cmd("reset halt")
+                flags = self.reset_flags()
+                tick = self.get("tick")
+                rebooted = self.last_tick is not None and tick < self.last_tick
+                self.set_throt(0)
+                self.last_tick = tick
+                self.rebooted = False
+                print("  throttle 0 applied once the link came back: "
+                      + ("TICK RESTARTED -- the ESC rebooted (power-class reset: "
+                         "3V3 dipped or VIN collapsed)" if rebooted else
+                         "tick kept counting -- the ESC did not reset, only the SWD link dropped")
+                      + f"; RCC_CSR flags: {', '.join(flags) or 'none'}")
+                return
             except Exception:
-                pass
+                continue
+        # Last resort: a reset clears MOE, so the bridge goes open and the
+        # motor coasts rather than staying driven.
+        try:
+            self.ocd.cmd("reset halt")
+            self.forced_reset = True
+            print("  target unreachable for 0.3 s -- forced `reset halt` so the "
+                  "motor coasts (SFT/PIN flags below are from this)")
+        except Exception:
+            pass
 
 
 def pwm_str(esc: Escape32) -> str:
@@ -492,8 +749,27 @@ def pwm_str(esc: Escape32) -> str:
     return f"  pwm {ccr * 100 / (arr + 1):5.1f}%" if arr else ""
 
 
-def do_cfg(esc: Escape32, args: list[str]) -> None:
-    """Read or write the runtime cfg fields listed in CFG_FIELDS."""
+def do_cfg(esc: Escape32, args: list[str],
+           lsyms: dict[str, int] | None = None) -> None:
+    """Read or write the runtime cfg fields listed in CFG_FIELDS.
+
+    Refuses to show or edit RAM while the application is not running: in
+    that state 0x20000000 holds bootloader stack or flash-loader residue, and
+    the numbers merely look like settings (that was the garbage after a
+    failed `save`).  With no arguments it falls back to the values in the
+    flash page, which is what the ESC will load once it does boot.
+    """
+    if not esc.firmware_alive():
+        print("  firmware is not running -- RAM holds no cfg ("
+              + esc.not_alive_hint() + ")")
+        if lsyms is not None and not args:
+            page = lsyms["_cfg"]
+            print(f"  values saved in the flash page {page:#x}:")
+            for n, (a, lo, hi) in CFG_FIELDS.items():
+                v = esc.ocd.read(page + (a - CFG_BASE), 8)
+                print(f"  {n:11s} {v:3d}   [{lo}..{hi}]")
+        print("  `reset` to start it; if it does not come back, `restore`")
+        return
     if not args:
         for n, (a, lo, hi) in CFG_FIELDS.items():
             print(f"  {n:11s} {esc.ocd.read(a, 8):3d}   [{lo}..{hi}]")
@@ -550,11 +826,22 @@ def do_trace(esc: Escape32, throt: int, secs: float) -> None:
     print(f"trace: throt {throt} for {secs}s  (Ctrl-C cuts throttle)")
     samples: list[tuple[float, dict[str, int]]] = []
     t0 = time.time()
+    glitches = 0
     try:
         esc.set_throt(throt)
-        n = 0
+        n = misses = 0
         while time.time() - t0 < secs:
-            samples.append((time.time() - t0, esc.snapshot()))
+            try:
+                samples.append((time.time() - t0, esc.snapshot()))
+                misses = 0
+            except RuntimeError:
+                # A corrupted read is dropped, not recorded; only a run of
+                # them means the link (or the target) is really gone.
+                glitches += 1
+                misses += 1
+                if misses >= 10:
+                    raise
+                continue
             n += 1
             # After a self-reset the core sits halted (vector catch) and reads
             # keep succeeding against frozen RAM, so the halt must be polled
@@ -581,7 +868,8 @@ def do_trace(esc: Escape32, throt: int, secs: float) -> None:
         return
 
     print(f"  {len(samples)} samples in {samples[-1][0]:.2f}s "
-          f"({len(samples) / max(samples[-1][0], 1e-6):.0f}/s)")
+          f"({len(samples) / max(samples[-1][0], 1e-6):.0f}/s)"
+          + (f", {glitches} corrupted reads dropped" if glitches else ""))
     print("    t(ms)  step  sync  prep  rev      ival     ERPM    ertm(us)")
     prev = None
     shown = 0
@@ -954,11 +1242,11 @@ def do_power(esc: Escape32, throt: int, secs: float) -> None:
         # A reboot puts ADC1/ADC2/DMA back exactly as init() wants them; the
         # vector catch then holds the core at the vector, hence the resume.
         try:
-            ocd.cmd("reset halt")
-            ocd.cmd("resume")
-            time.sleep(0.5)
-            esc.arm()
-            print("firmware rebooted and re-armed")
+            if esc.reboot():
+                print("firmware rebooted and re-armed")
+            else:
+                print("firmware rebooted but did not come back: "
+                      + esc.not_alive_hint())
         except RuntimeError as e:
             print(f"could not reboot/re-arm: {e}")
 
@@ -1227,57 +1515,153 @@ def do_knob(esc: Escape32, step: int, start: int = 250) -> None:
         print("\nthrottle cut")
 
 
+def write_cfg_page(esc: Escape32, page: int, data: bytes) -> bool:
+    """Burn `data` into the cfg flash page and bring the application back.
+
+    OpenOCD flashes with the core halted, and its flash loader runs in the
+    work area at 0x20000000 -- on top of the live cfg and the firmware's
+    state (stm32g4x.cfg, work-area-backup 0).  So: halt at reset, write, read
+    the page back, then a clean `reset run` so the firmware rebuilds its RAM
+    from the page it just got.  `program` is deliberately not used: it leaves
+    the core halted at the vector, and a `resume` from there followed by an
+    early read is what used to report garbage as a "MISMATCH".  Returns True
+    once the application is running on the new page.
+    """
+    size = len(data)
+    if int.from_bytes(data[:2], "little") != CFG_ID:
+        print(f"  refusing to write: image does not start with {CFG_ID:#06x}, "
+              "the bootloader would never jump to the app again")
+        return False
+    with tempfile.NamedTemporaryFile(prefix="escape32-cfg-", suffix=".bin",
+                                     delete=False) as f:
+        f.write(data)
+        path = f.name
+    ocd = esc.ocd
+    ocd.cmd("cortex_m vector_catch none")
+    try:
+        ocd.cmd("reset halt")
+        if ocd.state() != "halted":
+            print(f"  could not halt the core for flashing (state {ocd.state()})")
+            ocd.cmd("reset run")
+            return False
+        print(f"writing {size} bytes of cfg to {page:#x} ...")
+        reply = ocd.cmd(f"flash write_image erase {path} {page:#x}")
+        try:
+            back = esc.read_image(page, size)
+        except RuntimeError as e:
+            print(f"  could not read the page back: {e}")
+            back = None
+        ok_page = back == data
+        if ok_page:
+            print(f"  flash page verified ({size} bytes match, read twice)")
+        elif back is not None:
+            diff = next(i for i in range(size) if back[i] != data[i])
+            print(f"  FLASH MISMATCH at offset {diff} -- page not written as intended"
+                  + (f"\n  openocd: {reply}" if reply else ""))
+        ocd.cmd("reset run")
+        alive = esc.wait_alive(3.0)
+    finally:
+        ocd.cmd("cortex_m vector_catch reset")
+        os.unlink(path)
+    esc.last_tick = None
+    esc.rebooted = False
+    if not alive:
+        print("  firmware did not come back after the reset: " + esc.not_alive_hint())
+        return False
+    esc.arm()
+    return ok_page
+
+
+def cfg_defaults_from_elf(elf: str) -> bytes:
+    """The ELF's .cfg section: the page flash.sh programs, i.e. the build-time
+    defaults (CMakeLists.txt add_target ... TIMING=.. and friends)."""
+    objcopy = shutil.which("arm-none-eabi-objcopy")
+    if not objcopy:
+        raise RuntimeError("arm-none-eabi-objcopy is not on PATH")
+    with tempfile.NamedTemporaryFile(prefix="escape32-cfgdef-", suffix=".bin",
+                                     delete=False) as f:
+        path = f.name
+    try:
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.cfg", elf, path],
+                       check=True, capture_output=True, text=True)
+        with open(path, "rb") as f:
+            return f.read()
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"objcopy failed: {e.stderr.strip()}") from None
+    finally:
+        os.unlink(path)
+
+
 def do_save(esc: Escape32, lsyms: dict[str, int]) -> None:
     """Persist the live cfg to the flash config page -- ESCape32's `save`.
 
     The firmware's own savecfg() copies _cfg_start.._cfg_end (the SRAM cfg,
     i.e. what `cfg name value` has been editing) over the _cfg flash page and
-    reads it back at every boot (src/main.c:559).  Doing the same with
-    OpenOCD's `program` is byte-for-byte equivalent, and needs no UART.
-
-    `program` resets the core to do the flashing, so the ESC reboots: it
-    reloads the page it just got, lands in its arming loop, and is re-armed
-    here.  That reboot doubles as the proof that the saved values load.
-    Refused while the motor runs, like the firmware refuses (`ertm`).
+    reads it back at every boot (src/main.c:559).  This does the same over
+    SWD, byte for byte, then reboots the ESC and checks that it reloaded the
+    same values.  Refused while the motor runs, like the firmware refuses
+    (`ertm`), and refused while the application is not running -- RAM then
+    holds nothing worth saving (see write_cfg_page).
     """
+    if not esc.firmware_alive():
+        print("  firmware is not running -- RAM holds no cfg to save ("
+              + esc.not_alive_hint() + ")")
+        print("  `reset` first; if the ESC does not come back, `restore` "
+              "rewrites the default page")
+        return
     st = esc.snapshot()
     if st["step"] or st["throt"] or st["ertm"]:
         print("motor is running -- `stop` first (the ESC reboots during save)")
         return
     ram, ram_end, page = lsyms["_cfg_start"], lsyms["_cfg_end"], lsyms["_cfg"]
     size = ram_end - ram
-    data = esc.ocd.read_bytes(ram, size)[:size]
+    # The image is taken with a repeated bulk read and then checked field by
+    # field against single-byte reads: a shifted bulk read is the one way a
+    # page full of plausible-looking wrong values gets written (read_image).
+    data = esc.read_image(ram, size)
     before = {n: esc.ocd.read(a, 8) for n, (a, _, _) in CFG_FIELDS.items()}
-    with tempfile.NamedTemporaryFile(prefix="escape32-cfg-", suffix=".bin",
-                                     delete=False) as f:
-        f.write(data)
-        path = f.name
-    try:
-        print(f"writing {size} bytes of cfg to {page:#x} ...")
-        esc.ocd.cmd(f"program {path} {page:#x} verify")
-        # program's console text does not reliably come back over the Tcl
-        # port, so verify by reading the page back rather than parsing it.
-        back = esc.ocd.read_bytes(page, size)[:size]
-        if back != data:
-            diff = next(i for i in range(size) if back[i] != data[i])
-            print(f"  FLASH MISMATCH at offset {diff} -- save failed, not resuming")
+    bad = [f"{n} {data[a - CFG_BASE]}!={before[n]}"
+           for n, (a, _, _) in CFG_FIELDS.items() if data[a - CFG_BASE] != before[n]]
+    if bad:
+        print("  RAM image disagrees with field reads (SWD noise), nothing written: "
+              + ", ".join(bad) + "\n  run `save` again")
+        return
+    if not write_cfg_page(esc, page, data):
+        return
+    after = {n: esc.ocd.read(a, 8) for n, (a, _, _) in CFG_FIELDS.items()}
+    bad = [n for n in before if before[n] != after[n]]
+    if bad:
+        print("  MISMATCH after reboot: "
+              + ", ".join(f"{n} {before[n]}->{after[n]}" for n in bad))
+    else:
+        print("  saved; ESC rebooted and reloaded the same values:")
+        for n in CFG_FIELDS:
+            print(f"    {n:11s} {after[n]}")
+
+
+def do_restore(esc: Escape32, lsyms: dict[str, int], elf: str) -> None:
+    """Rewrite the cfg page with the build-time defaults from the ELF.
+
+    The way out of a bootloader lock-up (a page without the 0x32ea magic),
+    and a plain factory reset otherwise.  Everything `save`d so far is lost,
+    including the spin direction set over DShot -- run `send_file.py dshotdir`
+    again afterwards.
+    """
+    if esc.firmware_alive():
+        st = esc.snapshot()
+        if st["step"] or st["throt"] or st["ertm"]:
+            print("motor is running -- `stop` first (the ESC reboots during restore)")
             return
-        print(f"  flash page verified ({size} bytes match)")
-        esc.ocd.cmd("resume")
-        time.sleep(0.6)
-        esc.last_tick = None
-        esc.rebooted = False
-        esc.arm()
-        after = {n: esc.ocd.read(a, 8) for n, (a, _, _) in CFG_FIELDS.items()}
-        bad = [n for n in before if before[n] != after[n]]
-        if bad:
-            print("  MISMATCH after reboot: " + ", ".join(f"{n} {before[n]}->{after[n]}" for n in bad))
-        else:
-            print("  saved; ESC rebooted and reloaded the same values:")
-            for n in CFG_FIELDS:
-                print(f"    {n:11s} {after[n]}")
-    finally:
-        os.unlink(path)
+    size = lsyms["_cfg_end"] - lsyms["_cfg_start"]
+    data = cfg_defaults_from_elf(elf)
+    if len(data) != size or int.from_bytes(data[:2], "little") != CFG_ID:
+        print(f"  .cfg section of {os.path.relpath(elf, HERE)} looks wrong "
+              f"({len(data)} bytes, expected {size}) -- wrong ELF?")
+        return
+    print(f"restoring the build's default cfg page from {os.path.relpath(elf, HERE)}")
+    if write_cfg_page(esc, lsyms["_cfg"], data):
+        print("  restored; the ESC is running on the default page:")
+        do_cfg(esc, [], lsyms)
 
 
 def do_ramp(esc: Escape32, stop: int, step: int, dwell: float) -> None:
@@ -1296,14 +1680,25 @@ def do_ramp(esc: Escape32, stop: int, step: int, dwell: float) -> None:
             level = min(level + step, stop)
             esc.set_throt(level)
             time.sleep(dwell)
-            print(f"  {level * 100 / 2000:5.1f}% of range   "
-                  f"{fmt_status(esc.snapshot())}{pwm_str(esc)}")
+            try:
+                line = fmt_status(esc.snapshot()) + pwm_str(esc)
+            except RuntimeError as e:
+                # One unreadable level is not worth aborting the ramp; the
+                # throttle stays where it is and the next level reads again.
+                line = f"(read glitch: {str(e).splitlines()[0]})"
+            print(f"  {level * 100 / 2000:5.1f}% of range   {line}")
+            try:
+                if esc.check_reset():
+                    break
+            except RuntimeError:
+                pass
     finally:
         esc.safe_stop()
         print("throttle cut")
 
 
-def do_repl(esc: Escape32, lsyms: dict[str, int] | None = None) -> None:
+def do_repl(esc: Escape32, lsyms: dict[str, int] | None = None,
+            elf: str | None = None) -> None:
     print("commands:  throt <-2000..2000> | stop | status | watch [sec]")
     print("           trace <throt> [sec]        commutation/sync trace")
     print("           zc <throt> [sec]           per-step comparator ZC check")
@@ -1313,6 +1708,7 @@ def do_repl(esc: Escape32, lsyms: dict[str, int] | None = None) -> None:
     print("           knob [step] [start]   keyboard throttle: arrows / PgUp PgDn / space=0 / q")
     print("           cfg [field [value]]   runtime cfg (timing, duty_max, ...; RAM until saved)")
     print("           save                  write the live cfg to the flash config page (ESC reboots)")
+    print("           restore               rewrite the page with the build's defaults (bootloader lock-up fix)")
     print("           reset | quit")
     while True:
         try:
@@ -1347,9 +1743,12 @@ def do_repl(esc: Escape32, lsyms: dict[str, int] | None = None) -> None:
                 end = time.time() + secs
                 try:
                     while time.time() < end:
-                        if esc.check_reset():
-                            break
-                        print(fmt_status(esc.snapshot()) + pwm_str(esc))
+                        try:
+                            if esc.check_reset():
+                                break
+                            print(fmt_status(esc.snapshot()) + pwm_str(esc))
+                        except RuntimeError as e:
+                            print(f"(read glitch: {str(e).splitlines()[0]})")
                         time.sleep(0.2)
                 except KeyboardInterrupt:
                     esc.safe_stop()
@@ -1379,17 +1778,23 @@ def do_repl(esc: Escape32, lsyms: dict[str, int] | None = None) -> None:
                         int(args[1]) if len(args) > 1 else 100,
                         float(args[2]) if len(args) > 2 else 1.0)
             elif verb == "cfg":
-                do_cfg(esc, args)
+                do_cfg(esc, args, lsyms)
             elif verb == "save":
                 if lsyms is None:
                     print("save unavailable (no ELF symbols)")
                 else:
                     do_save(esc, lsyms)
+            elif verb == "restore":
+                if lsyms is None or elf is None:
+                    print("restore unavailable (no ELF)")
+                else:
+                    do_restore(esc, lsyms, elf)
             elif verb == "reset":
-                esc.ocd.cmd("reset run")
-                time.sleep(1.5)  # let the arming loop come back up
-                esc.arm()
-                print("reset, re-armed")
+                if esc.reboot():
+                    print("reset; firmware is back up and re-armed")
+                else:
+                    print("reset, but the firmware did not come back: "
+                          + esc.not_alive_hint())
             else:
                 print(f"unknown command: {verb}")
         except KeyboardInterrupt:
@@ -1451,6 +1856,7 @@ def main():
 
     with ocd:
         esc = Escape32(ocd, syms)
+        esc.cfg_page = lsyms["_cfg"]
         print(f"state block {esc.base:#x}..{esc.base + esc.span:#x} "
               f"({esc.span} bytes) from {os.path.relpath(elf, HERE)}")
         if ocd.state() == "halted":
@@ -1458,24 +1864,23 @@ def main():
             # `reset halt` fallback: the firmware is not running at all.
             print(f"target was halted ({esc.reset_cause()}); resuming")
             ocd.cmd("resume")
-            time.sleep(0.5)
-        if esc.get("throt") == 1:
+            alive = esc.wait_alive(3.0)
+        else:
+            alive = esc.firmware_alive()
+        if not alive:
+            print("firmware is not running: " + esc.not_alive_hint())
+        elif esc.get("throt") == 1:
             print("ESC is in the power-on arming loop; sending zero throttle")
         esc.arm()
         # bemf/power clear MOE to float the phases and restore it in a
         # finally -- but a killed process skips that finally and strands the
         # bridge disabled, so the firmware commutates with no output and the
         # motor stays silent.  Catch that leftover on the next connect.
-        if not ocd.read(TIM1_BDTR) & TIM_BDTR_MOE:
+        if alive and not ocd.read(TIM1_BDTR) & TIM_BDTR_MOE:
             print("TIM1 MOE is cleared (left over from a motor-off test); "
                   "rebooting to restore it")
-            ocd.cmd("cortex_m vector_catch none")
-            ocd.cmd("reset halt")
-            ocd.cmd("resume")
-            time.sleep(0.6)
-            ocd.cmd("cortex_m vector_catch reset")
-            esc.last_tick = None
-            esc.arm()
+            if not esc.reboot():
+                print("firmware did not come back: " + esc.not_alive_hint())
         try:
             if args.bemf:
                 do_bemf(esc, args.secs if args.secs != 2.0 else 5.0)
@@ -1486,7 +1891,7 @@ def main():
                     return "--ramp must be within 1..2000"
                 do_ramp(esc, args.ramp, args.step, args.dwell)
             else:
-                do_repl(esc, lsyms)
+                do_repl(esc, lsyms, elf)
         finally:
             esc.safe_stop()
     return 0

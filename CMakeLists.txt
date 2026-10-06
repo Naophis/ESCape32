@@ -125,4 +125,27 @@ add_target(TMOTOR4 STM32G071 DEAD_TIME=35 COMP_MAP=123)
 # No USE_HSE: PF0/PF1 are the OSC pins and PF0 is used for TIM1_CH3N, so
 # there is no crystal -- HSI16+PLL gives the same 168MHz, and THROT_CAL
 # defaults to 1 (automatic throttle calibration) as a result.
-add_target(MOUSEG431 STM32G431 DEAD_TIME=92 COMP_MAP=123)
+#
+# Config defaults, tuned on the bench for the 4S (16.8 V) suction fan
+# (2026-10-07, swdcli `ramp 1900 75 0.45`).  With the stock defaults
+# (TIMING 16, PWM 24..48 kHz) the ESC ran to full throttle on 12.6 V but
+# lost sync at ~40 % throttle (~300k ERPM) on 16.8 V, and the first kick
+# from rest cogged.  With these it held sync from 15 % to 93.8 % (895k ERPM)
+# on 16.8 V:
+#   TIMING=26      more advance (16 = 15 deg -> 26 = 24.4 deg)
+#   FREQ_MIN/MAX   fixed 24 kHz; at 300k ERPM the variable scheme ran 48 kHz,
+#                  i.e. ~1.6 switching edges per commutation step
+#   SINE_RANGE=10  sine startup below 10 % throttle, hand-over at ~210
+#   DUTY_SPUP=11   spin-up duty cap at the 12.6 V-equivalent of the stock 15 %
+#   VOLUME=100     audible beeps on the bench
+#   REVDIR=1       the direction system.yaml (suction_dshot_reverse: 1) sends
+#                  with DSHOTDIR anyway; baked in so a fresh flash spins the
+#                  right way without it
+# These land in the ELF's .cfg section, i.e. the page flash.sh programs and
+# swdcli `restore` writes back.  The mouse must cap suction_duty near 1760
+# (75 %) on 4S: that is the same applied voltage as 1999 on 3S; 93.8 % on
+# 16.8 V spins the impeller 1.4x its 3S speed.
+# Stock line, for reference:
+# add_target(MOUSEG431 STM32G431 DEAD_TIME=92 COMP_MAP=123)
+add_target(MOUSEG431 STM32G431 DEAD_TIME=92 COMP_MAP=123
+	TIMING=26 FREQ_MIN=24 FREQ_MAX=24 SINE_RANGE=10 DUTY_SPUP=11 VOLUME=100 REVDIR=1)
