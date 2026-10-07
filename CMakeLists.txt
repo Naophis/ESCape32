@@ -133,11 +133,13 @@ add_target(TMOTOR4 STM32G071 DEAD_TIME=35 COMP_MAP=123)
 # from rest cogged.  With these it held sync from 15 % to 93.8 % (895k ERPM)
 # on 16.8 V:
 #   TIMING=26      more advance (16 = 15 deg -> 26 = 24.4 deg)
-#   FREQ_MIN/MAX   fixed 24 kHz; at 300k ERPM the variable scheme ran 48 kHz,
-#                  i.e. ~1.6 switching edges per commutation step
+#   FREQ_MIN=24    PWM 24 kHz at low ERPM, scaling up to FREQ_MAX above 30k ERPM
+#   FREQ_MAX=48    (stock range).  The bench pass above was with a fixed 24 kHz
+#                  (FREQ_MAX=24); 48 is what the user settled on after
+#                  reflashing (2026-10-07).
 #   SINE_RANGE=10  sine startup below 10 % throttle, hand-over at ~210
 #   DUTY_SPUP=11   spin-up duty cap at the 12.6 V-equivalent of the stock 15 %
-#   VOLUME=100     audible beeps on the bench
+#   VOLUME=55      beeps audible but not distorted at 16.8 V (100 was clipping)
 #   REVDIR=1       the direction system.yaml (suction_dshot_reverse: 1) sends
 #                  with DSHOTDIR anyway; baked in so a fresh flash spins the
 #                  right way without it
@@ -148,4 +150,4 @@ add_target(TMOTOR4 STM32G071 DEAD_TIME=35 COMP_MAP=123)
 # Stock line, for reference:
 # add_target(MOUSEG431 STM32G431 DEAD_TIME=92 COMP_MAP=123)
 add_target(MOUSEG431 STM32G431 DEAD_TIME=92 COMP_MAP=123
-	TIMING=26 FREQ_MIN=24 FREQ_MAX=24 SINE_RANGE=10 DUTY_SPUP=11 VOLUME=100 REVDIR=1)
+	TIMING=26 FREQ_MIN=24 FREQ_MAX=48 SINE_RANGE=10 DUTY_SPUP=11 VOLUME=55 REVDIR=1)
